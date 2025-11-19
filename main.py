@@ -11,6 +11,7 @@ import re
 from unidecode import unidecode
 from difflib import get_close_matches
 import json
+import hashlib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -21,6 +22,12 @@ BOT_API_URL = 'https://core.telegram.org/bots/api'
 WEBAPPS_URL = 'https://core.telegram.org/bots/webapps'
 FEATURES_URL = 'https://core.telegram.org/bots/features'
 FAQ_URL = 'https://core.telegram.org/bots/faq'
+
+cache = {}
+
+def get_cache_key(query, entity_type, limit):
+    key_str = f"{query}:{entity_type}:{limit}"
+    return hashlib.md5(key_str.encode()).hexdigest()
 
 def init_db():
     with sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
@@ -371,6 +378,7 @@ async def update_docs():
                             (entity_id, keyword, weight)
                         )
             conn.commit()
+    cache.clear()
     return True
 
 def initial_load():
@@ -395,6 +403,10 @@ async def search_entities(query, entity_type=None, limit=20):
     query = query.strip().lower()
     if not query:
         return []
+    
+    cache_key = get_cache_key(query, entity_type, limit)
+    if cache_key in cache:
+        return cache[cache_key]
     
     try:
         with sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
@@ -514,6 +526,7 @@ async def search_entities(query, entity_type=None, limit=20):
                                 'similar'
                 })
             
+            cache[cache_key] = results
             return results
             
     except Exception as e:
@@ -542,9 +555,106 @@ async def handle_webhook(request):
     if request.method == 'POST':
         try:
             data = await request.json()
-            update_id = data.get('update_id')
             
-            if 'inline_query' in data:
+            if 'message' in data:
+                message = data['message']
+                chat_id = message['chat']['id']
+                text = message.get('text', '')
+                
+                if text == '/start':
+                    welcome_text = """
+🤖 *Telegram Bot API Search Bot*
+
+I can help you search through Telegram Bot API documentation quickly and easily!
+
+*Features:*
+• 🔍 Search methods, objects, and features
+• 📚 Get detailed documentation with examples
+• ⚡ Fast and cached responses
+• 🔗 Direct links to official docs
+
+*How to use:*
+1. Use inline mode: type `@your_bot_username query` in any chat
+2. Send /search command followed by your query
+3. Use the buttons below to get started!
+
+Try searching for: `sendMessage`, `ReplyKeyboardMarkup`, or `WebApp`
+"""
+                    
+                    keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "🔍 Search Inline", "switch_inline_query": ""},
+                                {"text": "📚 Official Docs", "url": "https://core.telegram.org/bots/api"}
+                            ],
+                            [
+                                {"text": "🤖 Bot Features", "callback_data": "features"},
+                                {"text": "❓ Help", "callback_data": "help"}
+                            ]
+                        ]
+                    }
+                    
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                            json={
+                                'chat_id': chat_id,
+                                'text': welcome_text,
+                                'parse_mode': 'Markdown',
+                                'reply_markup': keyboard
+                            }
+                        )
+                
+                elif text.startswith('/search'):
+                    query = text.replace('/search', '').strip()
+                    if not query:
+                        async with aiohttp.ClientSession() as session:
+                            await session.post(
+                                f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                                json={
+                                    'chat_id': chat_id,
+                                    'text': "Please provide a search query after /search command.\nExample: `/search sendMessage`",
+                                    'parse_mode': 'Markdown'
+                                }
+                            )
+                    else:
+                        results = await search_entities(query, limit=5)
+                        if not results:
+                            async with aiohttp.ClientSession() as session:
+                                await session.post(
+                                    f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                                    json={
+                                        'chat_id': chat_id,
+                                        'text': f"❌ No results found for: `{query}`\n\nTry a different keyword or check the spelling.",
+                                        'parse_mode': 'Markdown'
+                                    }
+                                )
+                        else:
+                            for result in results[:3]:
+                                message_text = f"*{result['name']}*\n\n{result['description']}"
+                                if len(message_text) > 4096:
+                                    message_text = message_text[:4000] + "...\n\n📖 *Read more in the official documentation*"
+                                
+                                keyboard = {
+                                    "inline_keyboard": [[
+                                        {"text": "📖 Open Docs", "url": result['reference']},
+                                        {"text": "🔍 Search More", "switch_inline_query_current_chat": query}
+                                    ]]
+                                }
+                                
+                                async with aiohttp.ClientSession() as session:
+                                    await session.post(
+                                        f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                                        json={
+                                            'chat_id': chat_id,
+                                            'text': message_text,
+                                            'parse_mode': 'Markdown',
+                                            'disable_web_page_preview': True,
+                                            'reply_markup': keyboard
+                                        }
+                                    )
+            
+            elif 'inline_query' in data:
                 inline_query = data['inline_query']
                 query_id = inline_query['id']
                 query_text = inline_query.get('query', '').strip()
@@ -558,6 +668,18 @@ async def handle_webhook(request):
                         "input_message_content": {
                             "message_text": "🔍 *Telegram Bot API Search*\n\nEnter a method or object name to search the official documentation.\n\nExamples: `sendMessage`, `ReplyKeyboardMarkup`, `WebApp`",
                             "parse_mode": "Markdown"
+                        },
+                        "reply_markup": {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "🔍 Search Methods", "switch_inline_query_current_chat": "send"},
+                                    {"text": "📚 Search Objects", "switch_inline_query_current_chat": "ReplyKeyboard"}
+                                ],
+                                [
+                                    {"text": "🌐 WebApp Docs", "switch_inline_query_current_chat": "WebApp"},
+                                    {"text": "📖 Full Documentation", "url": "https://core.telegram.org/bots/api"}
+                                ]
+                            ]
                         }
                     }]
                 else:
@@ -574,9 +696,12 @@ async def handle_webhook(request):
                                 "parse_mode": "Markdown"
                             },
                             "reply_markup": {
-                                "inline_keyboard": [[
-                                    {"text": "🔍 Search Again", "switch_inline_query_current_chat": ""}
-                                ]]
+                                "inline_keyboard": [
+                                    [
+                                        {"text": "🔍 Try Again", "switch_inline_query_current_chat": ""},
+                                        {"text": "📚 Popular Methods", "switch_inline_query_current_chat": "sendMessage"}
+                                    ]
+                                ]
                             }
                         }]
                     else:
@@ -618,6 +743,68 @@ async def handle_webhook(request):
                         }
                     )
             
+            elif 'callback_query' in data:
+                callback_query = data['callback_query']
+                callback_data = callback_query['data']
+                chat_id = callback_query['message']['chat']['id']
+                
+                if callback_data == 'features':
+                    features_text = """
+*🤖 Bot Features:*
+
+• ⚡ *Fast Search* - Instant API documentation search
+• 🔍 *Smart Matching* - Finds exact and similar matches
+• 📚 *Comprehensive* - Covers all Bot API methods and objects
+• 🌐 *WebApp Support* - Includes Telegram WebApp documentation
+• 🔗 *Direct Links* - Quick access to official documentation
+• 💾 *Cached* - Faster response times with caching
+
+Use inline mode in any chat by typing: `@your_bot_username query`
+"""
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                            json={
+                                'chat_id': chat_id,
+                                'text': features_text,
+                                'parse_mode': 'Markdown'
+                            }
+                        )
+                
+                elif callback_data == 'help':
+                    help_text = """
+*❓ How to use this bot:*
+
+1. *Inline Search* (Recommended):
+   - In any chat, type `@your_bot_username` followed by your query
+   - Example: `@your_bot_username sendMessage`
+
+2. *Direct Commands*:
+   - Use `/search query` in private chat with the bot
+   - Example: `/search ReplyKeyboardMarkup`
+
+3. *Popular Searches*:
+   - Methods: `sendMessage`, `editMessageText`, `answerCallbackQuery`
+   - Objects: `ReplyKeyboardMarkup`, `InlineKeyboardButton`, `Message`
+   - WebApp: `WebApp`, `initData`, `MainButton`
+
+*Need more help?* Try searching for any Bot API term!
+"""
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                            json={
+                                'chat_id': chat_id,
+                                'text': help_text,
+                                'parse_mode': 'Markdown'
+                            }
+                        )
+                
+                await session.post(
+                    f'https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery',
+                    json={'callback_query_id': callback_query['id']}
+                )
+            
             return web.Response(text='OK')
             
         except Exception as e:
@@ -626,24 +813,9 @@ async def handle_webhook(request):
     
     return web.Response(text='Method not allowed', status=405)
 
-async def handle_update_docs(request):
-    if request.method == 'POST':
-        try:
-            success = await update_docs()
-            if success:
-                return web.json_response({"status": "success"})
-            else:
-                return web.json_response({"status": "failed"}, status=500)
-        except Exception as e:
-            logger.error(f"Failed to update docs: {str(e)}")
-            return web.json_response({"error": "Internal server error"}, status=500)
-    
-    return web.Response(text='Method not allowed', status=405)
-
 app = web.Application()
 app.router.add_get('/api/search', handle_search)
 app.router.add_post('/webhook', handle_webhook)
-app.router.add_post('/api/update', handle_update_docs)
 
 if __name__ == '__main__':
     web.run_app(app, host='0.0.0.0', port=5000)
