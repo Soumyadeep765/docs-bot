@@ -766,7 +766,7 @@ async def search(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/types")
-@cache(expire=3600)  Cache for 1 hour
+@cache(expire=3600)  # Cache for 1 hour
 async def list_types():
     return {
         "types": [
@@ -823,12 +823,9 @@ async def health():
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=5000,
-        workers=4,  # Utilize multiple CPU cores
-        loop="asyncio",
-        http="httptools",
-        ws="websockets",
-        lifespan="on"
+        workers=1,  # Single worker for SQLite compatibility
+        loop="asyncio"
     )
