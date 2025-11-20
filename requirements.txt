@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 uvloop
 httpx
+h2
 aiosqlite
 orjson
 pytz
