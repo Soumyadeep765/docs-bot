@@ -108,8 +108,7 @@ async def lifespan(app: FastAPI):
     global client
     client = httpx.AsyncClient(
         timeout=30.0,
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-        http2=True
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
     )
     
     # Initialize cache
@@ -467,7 +466,7 @@ def format_content(content, format_type, source_url):
         return clean_html(content, source_url)
     elif format_type == 'markdown':
         return html_to_markdown(content, source_url)
-    else:
+    else:  # 'normal' format - use Telegram MDv1 (original behavior)
         return html_to_telegram_mdv1(content, source_url)
 
 def generate_reference_url(name, source_url, anchor=None):
@@ -610,9 +609,9 @@ async def search(
     q: str = Query(..., description="Search query"),
     entity_type: Optional[str] = Query(None, description="Filter by entity type"),
     limit: int = Query(20, ge=1, le=100, description="Number of results"),
-    format_type: str = Query("normal", description="Output format: normal, markdown, or html")
+    format: str = Query("normal", description="Output format: normal, markdown, or html")  # Changed from format_type to format
 ):
-    if format_type not in ['normal', 'markdown', 'html']:
+    if format not in ['normal', 'markdown', 'html']:
         raise HTTPException(status_code=400, detail="Invalid format parameter. Use 'normal', 'markdown' or 'html'")
     
     query = q.strip().lower()
@@ -620,7 +619,7 @@ async def search(
         raise HTTPException(status_code=400, detail="Missing search query")
     
     # Check cache first
-    cache_key = f"search:{query}:{entity_type}:{limit}:{format_type}"
+    cache_key = f"search:{query}:{entity_type}:{limit}:{format}"
     cached_result = search_cache.get(cache_key)
     if cached_result:
         return cached_result
@@ -729,8 +728,8 @@ async def search(
                 for field in fields:
                     formatted_fields.append({
                         'name': field['name'],
-                        'type': format_content(field['type'], format_type, result['source_url']),
-                        'description': format_content(field['description'], format_type, result['source_url']),
+                        'type': format_content(field['type'], format, result['source_url']),
+                        'description': format_content(field['description'], format, result['source_url']),
                         'clean_desc': field['clean_desc'],
                         'required': field['required']
                     })
@@ -739,9 +738,9 @@ async def search(
                     'id': result['id'],
                     'name': result['name'],
                     'type': result['type'],
-                    'description': format_content(result.get('description'), format_type, result['source_url']),
+                    'description': format_content(result.get('description'), format, result['source_url']),
                     'clean_desc': result.get('clean_desc'),
-                    'content': format_content(result.get('content'), format_type, result['source_url']),
+                    'content': format_content(result.get('content'), format, result['source_url']),
                     'fields': formatted_fields,
                     'reference': generate_reference_url(result['name'], result['source_url']),
                     'match_type': 'exact' if result in exact_matches else 
@@ -753,7 +752,7 @@ async def search(
                 'query': query,
                 'count': len(results),
                 'results': results,
-                'format': format_type
+                'format': format
             }
             
             # Cache the response
@@ -826,6 +825,6 @@ if __name__ == '__main__':
         app,
         host="0.0.0.0",
         port=5000,
-        workers=1,  # Single worker for SQLite compatibility
+        workers=1,
         loop="asyncio"
     )
