@@ -1,28 +1,29 @@
-from flask import Flask, request, jsonify
-from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import sqlite3
-import re
+import asyncio
+import aiosqlite
 import httpx
+import orjson
 from datetime import datetime, timedelta
 import pytz
-import threading
-import time
-import atexit
-import asyncio
 import logging
-from difflib import get_close_matches
-from unidecode import unidecode
-import os
-import json
-from functools import lru_cache
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Optional, Any
 import hashlib
 import pickle
+import os
+import re
+from contextlib import asynccontextmanager
+import uvloop
+from bs4 import BeautifulSoup
+from unidecode import unidecode
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Use uvloop for better async performance
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
 
 # Configuration
 BOT_API_URL = 'https://core.telegram.org/bots/api'
@@ -30,92 +31,74 @@ WEBAPPS_URL = 'https://core.telegram.org/bots/webapps'
 FEATURES_URL = 'https://core.telegram.org/bots/features'
 FAQ_URL = 'https://core.telegram.org/bots/faq'
 DB_FILE = 'bot_api.db'
-CACHE_DIR = 'cache'
 CACHE_DURATION = 3600  # 1 hour
 
-# Ensure cache directory exists
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-def adapt_datetime_iso(val):
-    return val.isoformat()
-
-def convert_datetime_iso(val):
-    return datetime.fromisoformat(val.decode())
-
-sqlite3.register_adapter(datetime, adapt_datetime_iso)
-sqlite3.register_converter("timestamp", convert_datetime_iso)
-
-class CacheManager:
-    @staticmethod
-    def get_cache_key(*args, **kwargs) -> str:
-        """Generate cache key from function arguments"""
-        key_str = f"{args}_{kwargs}"
-        return hashlib.md5(key_str.encode()).hexdigest()
+# Global in-memory cache
+class MemoryCache:
+    def __init__(self):
+        self._cache = {}
+        self._hits = 0
+        self._misses = 0
     
-    @staticmethod
-    def get_cache_file(func_name: str, key: str) -> str:
-        return os.path.join(CACHE_DIR, f"{func_name}_{key}.pkl")
-    
-    @staticmethod
-    def is_cache_valid(cache_file: str, max_age: int = CACHE_DURATION) -> bool:
-        if not os.path.exists(cache_file):
-            return False
-        file_time = os.path.getmtime(cache_file)
-        return (time.time() - file_time) < max_age
-    
-    @staticmethod
-    def get_cached_result(func_name: str, key: str):
-        cache_file = CacheManager.get_cache_file(func_name, key)
-        if CacheManager.is_cache_valid(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except Exception as e:
-                logger.warning(f"Cache read error for {func_name}: {e}")
+    def get(self, key: str):
+        if key in self._cache:
+            data, expiry = self._cache[key]
+            if expiry > datetime.now().timestamp():
+                self._hits += 1
+                return data
+            else:
+                del self._cache[key]
+        self._misses += 1
         return None
     
-    @staticmethod
-    def set_cached_result(func_name: str, key: str, data):
-        cache_file = CacheManager.get_cache_file(func_name, key)
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except Exception as e:
-            logger.warning(f"Cache write error for {func_name}: {e}")
+    def set(self, key: str, data: Any, duration: int = CACHE_DURATION):
+        expiry = datetime.now().timestamp() + duration
+        self._cache[key] = (data, expiry)
+    
+    def clear(self):
+        self._cache.clear()
+        self._hits = 0
+        self._misses = 0
+    
+    def stats(self):
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total * 100) if total > 0 else 0
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": f"{hit_rate:.1f}%",
+            "size": len(self._cache)
+        }
 
-def cache_result(func):
-    """Decorator to cache function results"""
-    def wrapper(*args, **kwargs):
-        # Skip caching for certain functions or conditions
-        if kwargs.get('nocache') or getattr(func, '__nocache__', False):
-            return func(*args, **kwargs)
-            
-        key = CacheManager.get_cache_key(*args, **kwargs)
-        func_name = func.__name__
-        
-        # Try to get from cache
-        cached_result = CacheManager.get_cached_result(func_name, key)
-        if cached_result is not None:
-            return cached_result
-        
-        # Execute function and cache result
-        result = func(*args, **kwargs)
-        if result is not None:
-            CacheManager.set_cached_result(func_name, key, result)
-        
-        return result
-    return wrapper
+# Global cache instance
+memory_cache = MemoryCache()
 
-def init_db():
-    with sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-        cursor = conn.cursor()
-        # Enable WAL mode for better concurrent read performance
-        cursor.execute('PRAGMA journal_mode=WAL')
-        cursor.execute('PRAGMA synchronous=NORMAL')
-        cursor.execute('PRAGMA cache_size=-64000')  # 64MB cache
-        cursor.execute('PRAGMA temp_store=memory')
+# Pre-compiled regex patterns
+CLEAN_PATTERN = re.compile(r'<.*?>')
+WORD_PATTERN = re.compile(r'\b\w{3,}\b')
+NAME_PATTERN = re.compile(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)')
+
+# Full database cache
+full_db_cache = {}
+
+# Global HTTP client
+client = httpx.AsyncClient(
+    timeout=30.0,
+    limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+    http2=True
+)
+
+async def init_db():
+    """Initialize database with proper schema"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Enable performance optimizations
+        await db.execute('PRAGMA journal_mode=WAL')
+        await db.execute('PRAGMA synchronous=NORMAL')
+        await db.execute('PRAGMA cache_size=-200000')  # 200MB cache
+        await db.execute('PRAGMA temp_store=memory')
         
-        cursor.execute('''
+        # Create tables (same as original but optimized)
+        await db.execute('''
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -123,11 +106,13 @@ def init_db():
             content TEXT,
             description TEXT,
             clean_desc TEXT,
-            last_updated timestamp NOT NULL,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             source_url TEXT NOT NULL,
             UNIQUE(name, type, source_url)
-        )''')
-        cursor.execute('''
+        )
+        ''')
+        
+        await db.execute('''
         CREATE TABLE IF NOT EXISTS fields (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_id INTEGER NOT NULL,
@@ -138,81 +123,182 @@ def init_db():
             required INTEGER DEFAULT 0,
             FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
             UNIQUE(entity_id, name)
-        )''')
-        cursor.execute('''
+        )
+        ''')
+        
+        await db.execute('''
         CREATE TABLE IF NOT EXISTS search_index (
             entity_id INTEGER NOT NULL,
             keyword TEXT NOT NULL,
             weight INTEGER DEFAULT 1,
             FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
             PRIMARY KEY (entity_id, keyword)
-        )''')
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS custom_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data_type TEXT NOT NULL,
-            name TEXT NOT NULL,
-            content TEXT NOT NULL,
-            metadata TEXT,
-            last_updated timestamp NOT NULL,
-            UNIQUE(data_type, name)
-        )''')
+        )
+        ''')
         
-        # Create indexes for better performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name, type)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_fields_entity_id ON fields(entity_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_search_keyword ON search_index(keyword)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_search_entity_keyword ON search_index(entity_id, keyword)')
+        # Create indexes for performance
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_search_keyword ON search_index(keyword)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_search_entity ON search_index(entity_id)')
         
-        cursor.execute('PRAGMA foreign_keys = ON')
-        conn.commit()
+        await db.execute('PRAGMA foreign_keys = ON')
+        await db.commit()
+        
+        logger.info("Database initialized with optimized schema")
 
-# Global HTTP client with connection pooling
-client = httpx.AsyncClient(
-    timeout=30.0,
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-    http2=True
-)
+async def load_full_db_cache():
+    """Load entire database into memory for lightning fast queries"""
+    global full_db_cache
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Load all entities
+        entities = {}
+        async with db.execute('''
+            SELECT id, name, type, description, clean_desc, source_url, content
+            FROM entities
+        ''') as cursor:
+            async for row in cursor:
+                entities[row['id']] = dict(row)
+        
+        # Load all search terms
+        search_terms = {}
+        async with db.execute('''
+            SELECT entity_id, keyword, weight 
+            FROM search_index
+        ''') as cursor:
+            async for row in cursor:
+                entity_id = row['entity_id']
+                if entity_id not in search_terms:
+                    search_terms[entity_id] = []
+                search_terms[entity_id].append((row['keyword'], row['weight']))
+        
+        # Load fields for each entity
+        entity_fields = {}
+        async with db.execute('''
+            SELECT entity_id, name, type, description, required
+            FROM fields
+        ''') as cursor:
+            async for row in cursor:
+                entity_id = row['entity_id']
+                if entity_id not in entity_fields:
+                    entity_fields[entity_id] = []
+                entity_fields[entity_id].append(dict(row))
+        
+        full_db_cache = {
+            'entities': entities,
+            'search_terms': search_terms,
+            'entity_fields': entity_fields,
+            'last_updated': datetime.now(pytz.utc),
+            'entity_count': len(entities),
+            'term_count': sum(len(terms) for terms in search_terms.values())
+        }
+    
+    logger.info(f"📦 Full DB cache loaded: {full_db_cache['entity_count']} entities, {full_db_cache['term_count']} terms")
 
-async def fetch_url(url):
+async def initial_data_load():
+    """Load initial data if database is empty"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute('SELECT COUNT(*) FROM entities')
+        count = (await cursor.fetchone())[0]
+        
+        if count == 0:
+            logger.info("No data found, performing initial data load...")
+            await update_documentation_data()
+        else:
+            logger.info(f"Database contains {count} entities")
+
+async def update_documentation_data():
+    """Update documentation from all sources"""
     try:
-        response = await client.get(url)
+        logger.info("Starting documentation update...")
+        
+        # Clear existing data
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute('DELETE FROM entities')
+            await db.execute('DELETE FROM fields')
+            await db.execute('DELETE FROM search_index')
+            await db.commit()
+        
+        # Fetch data from all sources
+        sources = [
+            (BOT_API_URL, await fetch_bot_api()),
+            (WEBAPPS_URL, await fetch_webapps()),
+            (FEATURES_URL, await fetch_features()),
+            (FAQ_URL, await fetch_faq())
+        ]
+        
+        entity_count = 0
+        for source_url, sections in sources:
+            if not sections:
+                continue
+                
+            for section in sections:
+                await save_entity_to_db(section, source_url)
+                entity_count += 1
+        
+        logger.info(f"Documentation update completed: {entity_count} entities")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Documentation update failed: {e}")
+        return False
+
+async def fetch_bot_api():
+    """Fetch Bot API documentation"""
+    try:
+        response = await client.get(BOT_API_URL)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         content_div = soup.find('div', class_='dev_page_content') or soup.find(id='dev_page_content')
-        return content_div
+        return parse_sections(content_div, ['h3', 'h4']) if content_div else None
     except Exception as e:
-        logger.error(f"Failed to fetch {url}: {str(e)}", exc_info=True)
+        logger.error(f"Failed to fetch Bot API: {e}")
         return None
-
-async def fetch_bot_api():
-    content_div = await fetch_url(BOT_API_URL)
-    if not content_div:
-        return None
-    return parse_sections(content_div, ['h3', 'h4'])
 
 async def fetch_webapps():
-    content_div = await fetch_url(WEBAPPS_URL)
-    if not content_div:
+    """Fetch WebApps documentation"""
+    try:
+        response = await client.get(WEBAPPS_URL)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        content_div = soup.find('div', class_='dev_page_content') or soup.find(id='dev_page_content')
+        return parse_sections(content_div, ['h2', 'h3', 'h4']) if content_div else None
+    except Exception as e:
+        logger.error(f"Failed to fetch WebApps: {e}")
         return None
-    return parse_sections(content_div, ['h2', 'h3', 'h4'])
 
 async def fetch_features():
-    content_div = await fetch_url(FEATURES_URL)
-    if not content_div:
+    """Fetch Features documentation"""
+    try:
+        response = await client.get(FEATURES_URL)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        content_div = soup.find('div', class_='dev_page_content') or soup.find(id='dev_page_content')
+        return parse_sections(content_div, ['h2', 'h3', 'h4']) if content_div else None
+    except Exception as e:
+        logger.error(f"Failed to fetch Features: {e}")
         return None
-    return parse_sections(content_div, ['h2', 'h3', 'h4'])
 
 async def fetch_faq():
-    content_div = await fetch_url(FAQ_URL)
-    if not content_div:
+    """Fetch FAQ documentation"""
+    try:
+        response = await client.get(FAQ_URL)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        content_div = soup.find('div', class_='dev_page_content') or soup.find(id='dev_page_content')
+        return parse_sections(content_div, ['h3', 'h4']) if content_div else None
+    except Exception as e:
+        logger.error(f"Failed to fetch FAQ: {e}")
         return None
-    return parse_sections(content_div, ['h3', 'h4'])
 
 def parse_sections(content_div, heading_tags):
-    """Optimized section parsing"""
+    """Parse content into sections"""
+    if not content_div:
+        return []
+        
     sections = []
     current_section = None
     
@@ -221,17 +307,15 @@ def parse_sections(content_div, heading_tags):
             if current_section:
                 sections.append(current_section)
             current_section = {
-                'title': element.get_text().strip(), 
-                'level': element.name, 
-                'content': '', 
+                'title': element.get_text().strip(),
+                'level': element.name,
+                'content': '',
                 'elements': [],
-                'anchor': element.get('id', '').strip() or element.find_parent('section', {'id': True})
+                'anchor': element.get('id', '')
             }
         elif current_section:
             current_section['elements'].append(element)
-            # Only build content string when needed
-            if len(current_section['elements']) < 50:  # Limit initial content building
-                current_section['content'] += str(element)
+            current_section['content'] += str(element)
     
     if current_section:
         sections.append(current_section)
@@ -239,8 +323,10 @@ def parse_sections(content_div, heading_tags):
     return sections
 
 def determine_entity_type(title, source_url):
+    """Determine entity type from title and source"""
     if not title:
         return 'other'
+    
     title = title.strip()
     if source_url == BOT_API_URL:
         if title and title[0].islower():
@@ -257,48 +343,91 @@ def determine_entity_type(title, source_url):
         return 'faq'
     return 'other'
 
-def clean_html(content, source_url):
-    if not content:
-        return ""
-    soup = BeautifulSoup(content, 'html.parser')
-    for tag in soup.find_all(True):
-        if tag.name not in ['strong', 'b', 'a', 'i', 'em', 'code', 'pre']:
-            tag.unwrap()
-    for a in soup.find_all('a'):
-        href = a.get('href', '').strip()
-        if href.startswith('#'):
-            a['href'] = f"{source_url}{href}"
-        elif href.startswith('/'):
-            a['href'] = f"https://core.telegram.org{href}"
-    return str(soup)
-
-def clean_text(content):
-    if not content:
-        return ""
-    soup = BeautifulSoup(content, 'html.parser')
-    return soup.get_text().strip()
+async def save_entity_to_db(section, source_url):
+    """Save entity to database"""
+    entity_type = determine_entity_type(section['title'], source_url)
+    if entity_type == 'other':
+        return
+    
+    # Build content if needed
+    if not section.get('content') and section.get('elements'):
+        section['content'] = ''.join(str(elem) for elem in section['elements'])
+    
+    # Parse entity details
+    details = parse_entity_details(section['content'], entity_type, source_url)
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Insert entity
+        cursor = await db.execute(
+            '''INSERT INTO entities (name, type, content, description, clean_desc, last_updated, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (
+                section['title'],
+                entity_type,
+                section['content'],
+                details['description'],
+                details['clean_desc'],
+                datetime.now(pytz.utc),
+                source_url
+            )
+        )
+        entity_id = cursor.lastrowid
+        
+        # Insert fields
+        for field in details.get('fields', []):
+            await db.execute(
+                '''INSERT INTO fields (entity_id, name, type, description, clean_desc, required)
+                VALUES (?, ?, ?, ?, ?, ?)''',
+                (
+                    entity_id,
+                    field['name'],
+                    field.get('type'),
+                    field.get('description'),
+                    field.get('clean_desc'),
+                    field.get('required', False)
+                )
+            )
+        
+        # Generate and insert search keywords
+        keywords = generate_search_keywords({
+            'name': section['title'],
+            'clean_desc': details['clean_desc'],
+            'fields': details.get('fields', [])
+        })
+        
+        for keyword in keywords:
+            weight = 1
+            if any(f['name'].lower() == keyword for f in details.get('fields', [])):
+                weight = 2
+            if section['title'].lower() == keyword:
+                weight = 3
+                
+            await db.execute(
+                "INSERT INTO search_index (entity_id, keyword, weight) VALUES (?, ?, ?)",
+                (entity_id, keyword, weight)
+            )
+        
+        await db.commit()
 
 def parse_entity_details(content, entity_type, source_url):
-    """Optimized entity details parsing"""
+    """Parse entity details from content"""
     if not content:
         return {'description': '', 'clean_desc': '', 'fields': []}
     
     soup = BeautifulSoup(content, 'html.parser')
     details = {'description': '', 'clean_desc': '', 'fields': []}
     
-    # Find first table to stop description collection
-    first_table = soup.find('table')
+    # Extract description (content before first table)
     description_elements = []
-    
     for elem in soup.children:
-        if elem == first_table:
+        if elem.name == 'table':
             break
         description_elements.append(str(elem))
     
     details['description'] = clean_html('\n'.join(description_elements), source_url)
     details['clean_desc'] = clean_text('\n'.join(description_elements))
     
-    # Parse tables more efficiently
+    # Parse fields from tables
     for table in soup.find_all('table'):
         headers = [th.text.strip().lower() for th in table.find_all('th')]
         if 'parameter' in headers or 'field' in headers:
@@ -307,7 +436,7 @@ def parse_entity_details(content, entity_type, source_url):
             required_index = headers.index('required') if 'required' in headers else -1
             desc_index = headers.index('description') if 'description' in headers else -1
             
-            for row in table.find_all('tr')[1:]:  # Skip header row
+            for row in table.find_all('tr')[1:]:
                 cols = row.find_all('td')
                 if len(cols) <= max(param_index, type_index, required_index, desc_index):
                     continue
@@ -323,531 +452,312 @@ def parse_entity_details(content, entity_type, source_url):
     
     return details
 
+def clean_html(content, source_url):
+    """Clean HTML content"""
+    if not content:
+        return ""
+    soup = BeautifulSoup(content, 'html.parser')
+    for tag in soup.find_all(True):
+        if tag.name not in ['strong', 'b', 'a', 'i', 'em', 'code', 'pre']:
+            tag.unwrap()
+    for a in soup.find_all('a'):
+        href = a.get('href', '').strip()
+        if href.startswith('#'):
+            a['href'] = f"{source_url}{href}"
+        elif href.startswith('/'):
+            a['href'] = f"https://core.telegram.org{href}"
+    return str(soup)
+
+def clean_text(content):
+    """Extract clean text from HTML"""
+    if not content:
+        return ""
+    soup = BeautifulSoup(content, 'html.parser')
+    return soup.get_text().strip()
+
 def generate_search_keywords(entity):
-    """Optimized keyword generation"""
+    """Generate search keywords for entity"""
     keywords = set()
     name = entity['name'].lower()
     
-    # Add name variations
-    name_parts = re.findall('[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)', entity['name'])
+    # Name parts
+    name_parts = NAME_PATTERN.findall(entity['name'])
     keywords.update(part.lower() for part in name_parts)
     keywords.add(name)
     
-    # Add description keywords (limit to significant words)
+    # Description keywords
     if entity.get('clean_desc'):
-        desc_keywords = set(re.findall(r'\b\w{4,}\b', entity['clean_desc'].lower()))
+        desc_keywords = set(WORD_PATTERN.findall(entity['clean_desc'].lower()))
         keywords.update(desc_keywords)
     
-    # Add field names and types
+    # Field names
     for field in entity.get('fields', []):
         keywords.add(field['name'].lower())
-        if field.get('type'):
-            # Extract text from HTML type field
-            soup = BeautifulSoup(field['type'], 'html.parser')
-            type_text = soup.get_text().lower()
-            type_keywords = set(re.findall(r'\b\w{4,}\b', type_text))
-            keywords.update(type_keywords)
     
-    # Normalize and filter keywords
+    # Normalize keywords
     normalized_keywords = set()
     for kw in keywords:
         normalized = unidecode(kw)
-        if len(normalized) >= 3 and len(normalized) <= 50:  # Reasonable length limits
+        if 3 <= len(normalized) <= 50:
             normalized_keywords.add(normalized)
     
-    return list(normalized_keywords)[:100]  # Limit keywords per entity
+    return list(normalized_keywords)[:100]
 
-def html_to_markdown(html, source_url):
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    # Process in order of specificity
-    for pre in soup.find_all('pre'):
-        code = pre.find('code')
-        if code:
-            pre.replace_with(f"```\n{code.get_text().strip()}\n```\n\n")
-        else:
-            pre.replace_with(f"```\n{pre.get_text().strip()}\n```\n\n")
-    
-    for code in soup.find_all('code'):
-        if not code.find_parent('pre'):
-            code.replace_with(f"`{code.get_text().strip()}`")
-    
-    for h in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-        level = int(h.name[1])
-        h.replace_with(f"{'#' * level} {h.get_text().strip()}\n\n")
-    
-    for b in soup.find_all(['b', 'strong']):
-        b.replace_with(f"**{b.get_text().strip()}**")
-    
-    for i in soup.find_all(['i', 'em']):
-        i.replace_with(f"*{i.get_text().strip()}*")
-    
-    for a in soup.find_all('a'):
-        text = a.get_text().strip()
-        href = a.get('href', '').strip()
-        if href.startswith('#'):
-            href = f"{source_url}{href}"
-        elif href.startswith('/'):
-            href = f"https://core.telegram.org{href}"
-        a.replace_with(f"[{text}]({href})" if href else text)
-    
-    text = str(soup)
-    # Optimized text cleaning
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r'[ \t]+\n', '\n', text)
-    text = re.sub(r'\n[ \t]+', '\n', text)
-    
-    return text.strip()
+def generate_cache_key(*args, **kwargs) -> str:
+    """Generate cache key"""
+    key_str = f"{args}_{kwargs}"
+    return hashlib.md5(key_str.encode()).hexdigest()
 
-def html_to_telegram_mdv1(html, source_url):
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, 'html.parser')
+def search_in_memory(query: str, entity_type: Optional[str] = None, limit: int = 20) -> List[Dict]:
+    """Ultra-fast in-memory search"""
+    query = query.lower().strip()
+    if not query:
+        return []
     
-    # Process code blocks first
-    for pre in soup.find_all('pre'):
-        code = pre.get_text().strip()
-        pre.replace_with(f"```\n{code}\n```\n\n")
+    results = []
+    query_terms = query.split()
     
-    for code in soup.find_all('code'):
-        if not code.find_parent('pre'):
-            code.replace_with(f"`{code.get_text(strip=True)}`")
+    for entity_id, entity in full_db_cache['entities'].items():
+        if entity_type and entity['type'] != entity_type:
+            continue
+        
+        score = 0
+        entity_terms = full_db_cache['search_terms'].get(entity_id, [])
+        
+        # Exact name match
+        if entity['name'].lower() == query:
+            score += 1000
+        
+        # Name contains query
+        if query in entity['name'].lower():
+            score += 500
+        
+        # Search in terms
+        for term, weight in entity_terms:
+            for q_term in query_terms:
+                if q_term in term:
+                    score += weight * 10
+                if term.startswith(q_term):
+                    score += weight * 5
+        
+        if score > 0:
+            # Get fields for this entity
+            fields = full_db_cache['entity_fields'].get(entity_id, [])
+            
+            results.append({
+                **entity,
+                'score': score,
+                'fields': fields,
+                'match_terms': query_terms
+            })
     
-    for h in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-        h.replace_with(f"\n*{h.get_text(strip=True)}*\n\n")
-    
-    for b in soup.find_all(['b', 'strong']):
-        b.replace_with(f"*{b.get_text(strip=True)}*")
-    
-    for i in soup.find_all(['i', 'em']):
-        i.replace_with(f"_{i.get_text(strip=True)}_")
-    
-    for a in soup.find_all('a'):
-        text = a.get_text(strip=True)
-        href = a.get('href', '').strip()
-        if href.startswith('#'):
-            href = f"{source_url}{href}"
-        elif href.startswith('/'):
-            href = f"https://core.telegram.org{href}"
-        a.replace_with(f"[{text}]({href})" if href else text)
-    
-    text = str(soup)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r'[ \t]+\n', '\n', text)
-    text = re.sub(r'\n[ \t]+', '\n', text)
-    
-    return text.strip()
-    
-def format_content(content, format_type, source_url):
+    # Sort by score and limit
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:limit]
+
+def fast_format_content(content: str, format_type: str = "normal") -> str:
+    """Fast content formatting"""
     if not content:
         return ""
     
-    if format_type == 'html':
-        return clean_html(content, source_url)
-    elif format_type == 'markdown':
-        return html_to_markdown(content, source_url)
-    else:
-        return html_to_telegram_mdv1(content, source_url)
-
-def generate_reference_url(name, source_url, anchor=None):
-    if anchor:
-        return f"{source_url}#{anchor}"
-    name = name.lower().replace(' ', '-')
-    if source_url == BOT_API_URL:
-        return f"{BOT_API_URL}#{name}"
-    elif source_url == WEBAPPS_URL:
-        return f"{WEBAPPS_URL}#{name}"
-    elif source_url == FEATURES_URL:
-        return f"{FEATURES_URL}#{name}"
-    elif source_url == FAQ_URL:
-        return f"{FAQ_URL}#{name}"
-    return source_url
-
-async def update_docs():
-    """Optimized documentation update with batch operations"""
-    now = datetime.now(pytz.utc)
+    if format_type == "html":
+        return content
     
-    with sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-        cursor = conn.cursor()
-        
-        # Use transaction for better performance
-        cursor.execute("BEGIN TRANSACTION")
-        
-        # Clear old data
-        cursor.execute("DELETE FROM entities WHERE source_url IN (?, ?, ?, ?)", 
-                      (BOT_API_URL, WEBAPPS_URL, FEATURES_URL, FAQ_URL))
-        
-        # Fetch all sources concurrently
-        sources = [
-            (BOT_API_URL, await fetch_bot_api()),
-            (WEBAPPS_URL, await fetch_webapps()),
-            (FEATURES_URL, await fetch_features()),
-            (FAQ_URL, await fetch_faq())
-        ]
-        
-        entity_count = 0
-        for source_url, sections in sources:
-            if not sections:
-                continue
-                
-            for section in sections:
-                entity_type = determine_entity_type(section['title'], source_url)
-                if entity_type == 'other':
-                    continue
-                
-                # Build full content only when needed
-                if not section.get('content') and section.get('elements'):
-                    section['content'] = ''.join(str(elem) for elem in section['elements'])
-                
-                details = parse_entity_details(section['content'], entity_type, source_url)
-                
-                # Insert entity
-                cursor.execute(
-                    '''INSERT INTO entities (name, type, content, description, clean_desc, last_updated, source_url)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    (
-                        section['title'], 
-                        entity_type, 
-                        section['content'], 
-                        details['description'], 
-                        details['clean_desc'], 
-                        now, 
-                        source_url
-                    )
-                )
-                entity_id = cursor.lastrowid
-                entity_count += 1
-                
-                # Batch insert fields
-                field_data = []
-                for field in details.get('fields', []):
-                    field_data.append((
-                        entity_id, 
-                        field['name'], 
-                        field.get('type'), 
-                        field.get('description'), 
-                        field.get('clean_desc'), 
-                        field.get('required', False)
-                    ))
-                
-                if field_data:
-                    cursor.executemany(
-                        '''INSERT INTO fields (entity_id, name, type, description, clean_desc, required)
-                        VALUES (?, ?, ?, ?, ?, ?)''',
-                        field_data
-                    )
-                
-                # Generate and insert keywords
-                keywords = generate_search_keywords({
-                    'name': section['title'],
-                    'clean_desc': details['clean_desc'],
-                    'fields': details.get('fields', [])
-                })
-                
-                keyword_data = []
-                for keyword in keywords:
-                    weight = 1
-                    if any(f['name'].lower() == keyword for f in details.get('fields', [])):
-                        weight = 2
-                    if section['title'].lower() == keyword:
-                        weight = 3
-                    keyword_data.append((entity_id, keyword, weight))
-                
-                if keyword_data:
-                    cursor.executemany(
-                        "INSERT INTO search_index (entity_id, keyword, weight) VALUES (?, ?, ?)",
-                        keyword_data
-                    )
-        
-        cursor.execute("COMMIT")
-        logger.info(f"Updated {entity_count} entities")
+    if format_type == "markdown":
+        # Basic markdown conversion
+        content = re.sub(r'<br\s*/?>', '\n', content)
+        content = re.sub(r'<strong>(.*?)</strong>', r'**\1**', content)
+        content = re.sub(r'<code>(.*?)</code>', r'`\1`', content)
+        content = CLEAN_PATTERN.sub('', content)
+        return content
     
-    # Clear search cache after update
-    clear_search_cache()
-    return True
+    # Default: strip HTML
+    return CLEAN_PATTERN.sub('', content)
 
-def clear_search_cache():
-    """Clear all search-related cache files"""
-    try:
-        for filename in os.listdir(CACHE_DIR):
-            if filename.startswith(('search_', 'list_entities_')):
-                os.remove(os.path.join(CACHE_DIR, filename))
-        logger.info("Search cache cleared")
-    except Exception as e:
-        logger.warning(f"Error clearing cache: {e}")
+# FastAPI App with Lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await init_db()
+    await initial_data_load()
+    await load_full_db_cache()
+    logger.info("🚀 Server started with full DB caching and initialization")
+    yield
+    # Shutdown
+    await client.aclose()
 
-def initial_load():
-    """Optimized initial load with progress tracking"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        db_exists = os.path.exists(DB_FILE)
-        needs_load = False
-        
-        if db_exists:
-            with sqlite3.connect(DB_FILE) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) FROM entities')
-                entity_count = cursor.fetchone()[0]
-                needs_load = entity_count == 0
-        else:
-            needs_load = True
-            
-        if needs_load:
-            logger.info("Performing initial database load")
-            success = loop.run_until_complete(update_docs())
-            if success:
-                logger.info("Initial database load completed successfully")
-            else:
-                logger.error("Initial database load failed")
-        else:
-            logger.info(f"Database already exists with {entity_count} entities")
-    finally:
-        loop.close()
+app = FastAPI(
+    title="Ultra Fast Telegram Bot API",
+    description="Blazing fast Telegram Bot API search with proper initialization",
+    version="2.0.0",
+    lifespan=lifespan
+)
 
-# Initialize database and load data
-init_db()
-initial_load()
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def cleanup():
-    asyncio.run(client.aclose())
-
-atexit.register(cleanup)
-
-@app.route('/api/search', methods=['GET'])
-@cache_result
-def search():
-    """Optimized search with caching"""
-    query = request.args.get('q', '').strip().lower()
-    entity_type = request.args.get('type')
-    limit = int(request.args.get('limit', 20))
-    format_type = request.args.get('format', 'normal')
-    
-    if format_type not in ['normal', 'markdown', 'html']:
-        return jsonify({"error": "Invalid format parameter. Use 'normal', 'markdown' or 'html'"}), 400
-    
-    if not query:
-        return jsonify({"error": "Missing search query"}), 400
-    
-    try:
-        with sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            # Exact matches (most relevant)
-            exact_query = '''
-            SELECT e.id, e.name, e.type, e.description, e.clean_desc, 
-                   COALESCE(e.content, '') as content, e.source_url
-            FROM entities e
-            WHERE LOWER(e.name) = ?
-            '''
-            exact_params = [query]
-            if entity_type:
-                exact_query += ' AND e.type = ?'
-                exact_params.append(entity_type)
-            
-            cursor.execute(exact_query, exact_params)
-            exact_matches = [dict(row) for row in cursor.fetchall()]
-            
-            # Keyword matches with scoring
-            keyword_query = '''
-            SELECT e.id, e.name, e.type, e.description, e.clean_desc, 
-                   COALESCE(e.content, '') as content, SUM(si.weight) as score, e.source_url
-            FROM entities e
-            JOIN search_index si ON e.id = si.entity_id
-            WHERE si.keyword LIKE ? || '%'
-            '''
-            keyword_params = [query]
-            if entity_type:
-                keyword_query += ' AND e.type = ?'
-                keyword_params.append(entity_type)
-            
-            keyword_query += '''
-            GROUP BY e.id
-            ORDER BY score DESC, e.name
-            LIMIT ?
-            '''
-            keyword_params.append(limit)
-            
-            cursor.execute(keyword_query, keyword_params)
-            keyword_matches = [dict(row) for row in cursor.fetchall()]
-            
-            # Similar matches using fuzzy matching
-            similar_results = []
-            if len(exact_matches) + len(keyword_matches) < limit:
-                cursor.execute('SELECT name, type FROM entities')
-                all_entities = [(row[0].lower(), row[1]) for row in cursor.fetchall()]
-                
-                if entity_type:
-                    all_names = [name for name, typ in all_entities if typ == entity_type]
-                else:
-                    all_names = [name for name, typ in all_entities]
-                
-                similar_names = get_close_matches(query, all_names, n=5, cutoff=0.3)
-                
-                if similar_names:
-                    placeholders = ','.join(['?'] * len(similar_names))
-                    similar_query = f'''
-                    SELECT e.id, e.name, e.type, e.description, e.clean_desc, 
-                           COALESCE(e.content, '') as content, e.source_url
-                    FROM entities e
-                    WHERE LOWER(e.name) IN ({placeholders})
-                    '''
-                    if entity_type:
-                        similar_query += ' AND e.type = ?'
-                        similar_params = similar_names + [entity_type]
-                    else:
-                        similar_params = similar_names
-                    
-                    cursor.execute(similar_query, similar_params)
-                    similar_results = [dict(row) for row in cursor.fetchall()]
-            
-            # Combine and deduplicate results
-            combined_results = []
-            seen_ids = set()
-            
-            for match in exact_matches + keyword_matches + similar_results:
-                if match['id'] not in seen_ids and len(combined_results) < limit:
-                    seen_ids.add(match['id'])
-                    combined_results.append(match)
-            
-            # Format results
-            results = []
-            for result in combined_results:
-                # Get fields for this entity
-                cursor.execute('''
-                SELECT name, type, description, clean_desc, required
-                FROM fields
-                WHERE entity_id = ?
-                ORDER BY required DESC, name
-                ''', (result['id'],))
-                fields = [dict(row) for row in cursor.fetchall()]
-                
-                formatted_fields = []
-                for field in fields:
-                    formatted_fields.append({
-                        'name': field['name'],
-                        'type': format_content(field['type'], format_type, result['source_url']),
-                        'description': format_content(field['description'], format_type, result['source_url']),
-                        'clean_desc': field['clean_desc'],
-                        'required': field['required']
-                    })
-                
-                results.append({
-                    'id': result['id'],
-                    'name': result['name'],
-                    'type': result['type'],
-                    'description': format_content(result.get('description'), format_type, result['source_url']),
-                    'clean_desc': result.get('clean_desc'),
-                    'content': format_content(result.get('content'), format_type, result['source_url']),
-                    'fields': formatted_fields,
-                    'reference': generate_reference_url(result['name'], result['source_url']),
-                    'match_type': 'exact' if result in exact_matches else 
-                                'keyword' if result in keyword_matches else 
-                                'similar'
-                })
-            
-            response = {
-                'query': query,
-                'count': len(results),
-                'results': results,
-                'format': format_type
-            }
-            
-            return response
-            
-    except Exception as e:
-        logger.error(f"Search failed: {str(e)}", exc_info=True)
-        return {"error": "Internal server error"}
-
-@app.route('/api/types', methods=['GET'])
-@cache_result
-def list_types():
+# API Routes (same as before but with proper data)
+@app.get("/")
+async def root():
     return {
-        "types": [
-            {"id": "method", "name": "Methods"},
-            {"id": "object", "name": "Objects"},
-            {"id": "webapp", "name": "WebApp Features"},
-            {"id": "feature", "name": "Bot Features"},
-            {"id": "faq", "name": "FAQ"},
-            {"id": "other", "name": "Other"}
-        ]
+        "status": "🚀 Ultra Fast Telegram Bot API",
+        "entities": full_db_cache['entity_count'],
+        "cache_stats": memory_cache.stats(),
+        "last_updated": full_db_cache['last_updated'].isoformat()
     }
 
-@app.route('/api/list', methods=['GET'])
-@cache_result
-def list_entities():
-    entity_type = request.args.get('type', '').strip().lower()
+@app.get("/api/search")
+async def search(
+    q: str = Query(..., min_length=1, max_length=100),
+    type: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    format: str = Query("normal")
+):
+    """Ultra-fast search endpoint"""
+    cache_key = generate_cache_key("search", q, type, limit, format)
     
-    if not entity_type:
-        return {"error": "Missing type parameter"}
-    
-    valid_types = ['method', 'object', 'webapp', 'feature', 'faq', 'other']
-    if entity_type not in valid_types:
-        return {"error": f"Invalid type. Valid types are: {', '.join(valid_types)}"}
+    # Check memory cache first
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
     
     try:
-        with sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT name
-                FROM entities 
-                WHERE type = ?
-                ORDER BY name
-            ''', (entity_type,))
-            
-            names = [row[0] for row in cursor.fetchall()]
-            return names
-            
-    except Exception as e:
-        logger.error(f"List entities failed: {str(e)}", exc_info=True)
-        return {"error": "Internal server error"}
-
-@app.route('/api/update', methods=['POST'])
-def update_docs_endpoint():
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        success = loop.run_until_complete(update_docs())
-        loop.close()
-        if success:
-            return jsonify({"status": "success"})
-        else:
-            return jsonify({"status": "failed"}), 500
-    except Exception as e:
-        logger.error(f"Failed to update docs: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
-@app.route('/api/cache/clear', methods=['POST'])
-def clear_cache_endpoint():
-    """Endpoint to manually clear cache"""
-    try:
-        clear_search_cache()
-        return jsonify({"status": "success", "message": "Cache cleared"})
-    except Exception as e:
-        logger.error(f"Failed to clear cache: {str(e)}")
-        return jsonify({"error": "Failed to clear cache"}), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for deployment"""
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT COUNT(*) FROM entities')
-            entity_count = cursor.fetchone()[0]
+        # Search in memory
+        start_time = datetime.now()
+        results = search_in_memory(q, type, limit)
+        search_time = (datetime.now() - start_time).total_seconds() * 1000
         
-        return jsonify({
-            "status": "healthy",
-            "entities": entity_count,
-            "timestamp": datetime.now(pytz.utc).isoformat()
-        })
+        # Format results
+        formatted_results = []
+        for result in results:
+            formatted_results.append({
+                "id": result["id"],
+                "name": result["name"],
+                "type": result["type"],
+                "description": fast_format_content(result.get("description", ""), format),
+                "clean_desc": result.get("clean_desc", ""),
+                "fields": result.get("fields", []),
+                "reference": f"{result['source_url']}#{result['name'].lower().replace(' ', '-')}",
+                "score": result["score"]
+            })
+        
+        response = {
+            "query": q,
+            "count": len(formatted_results),
+            "results": formatted_results,
+            "search_time_ms": search_time,
+            "format": format
+        }
+        
+        # Cache the result
+        memory_cache.set(cache_key, response)
+        
+        return JSONResponse(content=response)
+        
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+@app.get("/api/types")
+async def list_types():
+    """Get available entity types"""
+    cache_key = "types_list"
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
+    
+    types_count = {}
+    for entity in full_db_cache['entities'].values():
+        types_count[entity['type']] = types_count.get(entity['type'], 0) + 1
+    
+    types_list = [{"id": type_id, "name": type_id.title(), "count": count} 
+                 for type_id, count in types_count.items()]
+    
+    memory_cache.set(cache_key, types_list)
+    return JSONResponse(content=types_list)
+
+@app.get("/api/list")
+async def list_entities(type: str = Query(..., min_length=1)):
+    """List all entities of a type"""
+    cache_key = generate_cache_key("list", type)
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
+    
+    entities = []
+    for entity in full_db_cache['entities'].values():
+        if entity['type'] == type:
+            entities.append(entity['name'])
+    
+    entities.sort()
+    memory_cache.set(cache_key, entities)
+    return JSONResponse(content=entities)
+
+@app.post("/api/update")
+async def update_docs():
+    """Update documentation data"""
+    try:
+        success = await update_documentation_data()
+        if success:
+            # Reload cache
+            await load_full_db_cache()
+            memory_cache.clear()
+            return {"status": "success", "entities": full_db_cache['entity_count']}
+        else:
+            raise HTTPException(status_code=500, detail="Update failed")
+    except Exception as e:
+        logger.error(f"Update error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/stats")
+async def get_stats():
+    """Get performance statistics"""
+    return {
+        "memory_cache": memory_cache.stats(),
+        "database": {
+            "entities": full_db_cache['entity_count'],
+            "search_terms": full_db_cache['term_count'],
+            "last_updated": full_db_cache['last_updated'].isoformat()
+        }
+    }
+
+@app.post("/api/cache/clear")
+async def clear_cache():
+    """Clear all caches"""
+    memory_cache.clear()
+    return {"status": "success", "message": "Cache cleared"}
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "entities": full_db_cache['entity_count'],
+        "cache_hit_rate": memory_cache.stats()["hit_rate"],
+        "timestamp": datetime.now(pytz.utc).isoformat()
+    }
+
+# Performance monitoring
+@app.middleware("http")
+async def add_process_time_header(request, call_next):
+    start_time = datetime.now()
+    response = await call_next(request)
+    process_time = (datetime.now() - start_time).total_seconds() * 1000
+    response.headers["X-Process-Time-MS"] = f"{process_time:.2f}"
+    return response
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=5000,
+        workers=1,
+        loop="uvloop",
+        http="httptools",
+        access_log=False
+    )
