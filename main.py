@@ -9,7 +9,7 @@ import orjson
 from datetime import datetime, timedelta
 import pytz
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import hashlib
 import pickle
 import os
@@ -77,6 +77,8 @@ memory_cache = MemoryCache()
 CLEAN_PATTERN = re.compile(r'<.*?>')
 WORD_PATTERN = re.compile(r'\b\w{3,}\b')
 NAME_PATTERN = re.compile(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)')
+NOTE_PATTERN = re.compile(r'<strong>(\d+)\.</strong>\s*(.*?)(?=<strong>\d+\.</strong>|</blockquote>|$)', re.DOTALL)
+BLOCKQUOTE_PATTERN = re.compile(r'<blockquote>(.*?)</blockquote>', re.DOTALL)
 
 # Full database cache
 full_db_cache = {}
@@ -89,7 +91,7 @@ client = httpx.AsyncClient(
 )
 
 async def init_db():
-    """Initialize database with proper schema"""
+    """Initialize database with proper schema including notes"""
     async with aiosqlite.connect(DB_FILE) as db:
         # Enable performance optimizations
         await db.execute('PRAGMA journal_mode=WAL')
@@ -97,14 +99,16 @@ async def init_db():
         await db.execute('PRAGMA cache_size=-200000')  # 200MB cache
         await db.execute('PRAGMA temp_store=memory')
         
-        # Create tables (same as original but optimized)
+        # Create tables with notes support
         await db.execute('''
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             type TEXT NOT NULL,
             content TEXT,
-            description TEXT,
+            description_html TEXT,
+            description_text TEXT,
+            description_markdown TEXT,
             clean_desc TEXT,
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             source_url TEXT NOT NULL,
@@ -118,11 +122,25 @@ async def init_db():
             entity_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             type TEXT,
-            description TEXT,
-            clean_desc TEXT,
+            description_html TEXT,
+            description_text TEXT,
+            description_markdown TEXT,
             required INTEGER DEFAULT 0,
             FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
             UNIQUE(entity_id, name)
+        )
+        ''')
+        
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            note_number INTEGER NOT NULL,
+            content_html TEXT NOT NULL,
+            content_text TEXT NOT NULL,
+            content_markdown TEXT NOT NULL,
+            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+            UNIQUE(entity_id, note_number)
         )
         ''')
         
@@ -141,11 +159,12 @@ async def init_db():
         await db.execute('CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_search_keyword ON search_index(keyword)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_search_entity ON search_index(entity_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_notes_entity ON notes(entity_id)')
         
         await db.execute('PRAGMA foreign_keys = ON')
         await db.commit()
         
-        logger.info("Database initialized with optimized schema")
+        logger.info("Database initialized with optimized schema including notes")
 
 async def load_full_db_cache():
     """Load entire database into memory for lightning fast queries"""
@@ -157,7 +176,8 @@ async def load_full_db_cache():
         # Load all entities
         entities = {}
         async with db.execute('''
-            SELECT id, name, type, description, clean_desc, source_url, content
+            SELECT id, name, type, description_html, description_text, description_markdown, 
+                   clean_desc, source_url
             FROM entities
         ''') as cursor:
             async for row in cursor:
@@ -178,7 +198,7 @@ async def load_full_db_cache():
         # Load fields for each entity
         entity_fields = {}
         async with db.execute('''
-            SELECT entity_id, name, type, description, required
+            SELECT entity_id, name, type, description_html, description_text, description_markdown, required
             FROM fields
         ''') as cursor:
             async for row in cursor:
@@ -187,10 +207,29 @@ async def load_full_db_cache():
                     entity_fields[entity_id] = []
                 entity_fields[entity_id].append(dict(row))
         
+        # Load notes for each entity
+        entity_notes = {}
+        async with db.execute('''
+            SELECT entity_id, note_number, content_html, content_text, content_markdown
+            FROM notes
+            ORDER BY note_number
+        ''') as cursor:
+            async for row in cursor:
+                entity_id = row['entity_id']
+                if entity_id not in entity_notes:
+                    entity_notes[entity_id] = []
+                entity_notes[entity_id].append({
+                    'number': row['note_number'],
+                    'html': row['content_html'],
+                    'text': row['content_text'],
+                    'markdown': row['content_markdown']
+                })
+        
         full_db_cache = {
             'entities': entities,
             'search_terms': search_terms,
             'entity_fields': entity_fields,
+            'entity_notes': entity_notes,
             'last_updated': datetime.now(pytz.utc),
             'entity_count': len(entities),
             'term_count': sum(len(terms) for terms in search_terms.values())
@@ -219,6 +258,7 @@ async def update_documentation_data():
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute('DELETE FROM entities')
             await db.execute('DELETE FROM fields')
+            await db.execute('DELETE FROM notes')
             await db.execute('DELETE FROM search_index')
             await db.commit()
         
@@ -343,8 +383,43 @@ def determine_entity_type(title, source_url):
         return 'faq'
     return 'other'
 
+def extract_notes(content: str) -> Tuple[str, List[Dict]]:
+    """Extract notes from content and return cleaned content + notes list"""
+    if not content:
+        return content, []
+    
+    notes = []
+    
+    # Find blockquotes containing notes
+    blockquote_matches = BLOCKQUOTE_PATTERN.findall(content)
+    
+    for blockquote in blockquote_matches:
+        # Extract individual notes
+        note_matches = NOTE_PATTERN.findall(blockquote)
+        
+        for note_num, note_content in note_matches:
+            note_num = int(note_num.strip())
+            note_content = note_content.strip()
+            
+            # Create formatted versions
+            html_content = f"<strong>{note_num}.</strong> {note_content}"
+            text_content = clean_text(html_content)
+            markdown_content = html_to_markdown(html_content)
+            
+            notes.append({
+                'number': note_num,
+                'html': html_content,
+                'text': text_content,
+                'markdown': markdown_content
+            })
+    
+    # Remove blockquotes from content
+    cleaned_content = BLOCKQUOTE_PATTERN.sub('', content)
+    
+    return cleaned_content, notes
+
 async def save_entity_to_db(section, source_url):
-    """Save entity to database"""
+    """Save entity to database with formatted content and notes"""
     entity_type = determine_entity_type(section['title'], source_url)
     if entity_type == 'other':
         return
@@ -353,19 +428,25 @@ async def save_entity_to_db(section, source_url):
     if not section.get('content') and section.get('elements'):
         section['content'] = ''.join(str(elem) for elem in section['elements'])
     
-    # Parse entity details
-    details = parse_entity_details(section['content'], entity_type, source_url)
+    # Extract notes and clean content
+    cleaned_content, notes = extract_notes(section['content'])
+    
+    # Parse entity details from cleaned content
+    details = parse_entity_details(cleaned_content, entity_type, source_url)
     
     async with aiosqlite.connect(DB_FILE) as db:
-        # Insert entity
+        # Insert entity with pre-formatted content
         cursor = await db.execute(
-            '''INSERT INTO entities (name, type, content, description, clean_desc, last_updated, source_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            '''INSERT INTO entities (name, type, content, description_html, description_text, 
+            description_markdown, clean_desc, last_updated, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (
                 section['title'],
                 entity_type,
-                section['content'],
-                details['description'],
+                section['content'],  # Keep original for reference
+                details['description_html'],
+                details['description_text'],
+                details['description_markdown'],
                 details['clean_desc'],
                 datetime.now(pytz.utc),
                 source_url
@@ -373,17 +454,33 @@ async def save_entity_to_db(section, source_url):
         )
         entity_id = cursor.lastrowid
         
-        # Insert fields
+        # Insert notes
+        for note in notes:
+            await db.execute(
+                '''INSERT INTO notes (entity_id, note_number, content_html, content_text, content_markdown)
+                VALUES (?, ?, ?, ?, ?)''',
+                (
+                    entity_id,
+                    note['number'],
+                    note['html'],
+                    note['text'],
+                    note['markdown']
+                )
+            )
+        
+        # Insert fields with formatted content
         for field in details.get('fields', []):
             await db.execute(
-                '''INSERT INTO fields (entity_id, name, type, description, clean_desc, required)
-                VALUES (?, ?, ?, ?, ?, ?)''',
+                '''INSERT INTO fields (entity_id, name, type, description_html, description_text, 
+                description_markdown, required)
+                VALUES (?, ?, ?, ?, ?, ?, ?)''',
                 (
                     entity_id,
                     field['name'],
                     field.get('type'),
-                    field.get('description'),
-                    field.get('clean_desc'),
+                    field.get('description_html'),
+                    field.get('description_text'),
+                    field.get('description_markdown'),
                     field.get('required', False)
                 )
             )
@@ -410,12 +507,24 @@ async def save_entity_to_db(section, source_url):
         await db.commit()
 
 def parse_entity_details(content, entity_type, source_url):
-    """Parse entity details from content"""
+    """Parse entity details from content and pre-format all content"""
     if not content:
-        return {'description': '', 'clean_desc': '', 'fields': []}
+        return {
+            'description_html': '',
+            'description_text': '',
+            'description_markdown': '',
+            'clean_desc': '',
+            'fields': []
+        }
     
     soup = BeautifulSoup(content, 'html.parser')
-    details = {'description': '', 'clean_desc': '', 'fields': []}
+    details = {
+        'description_html': '',
+        'description_text': '',
+        'description_markdown': '',
+        'clean_desc': '',
+        'fields': []
+    }
     
     # Extract description (content before first table)
     description_elements = []
@@ -424,8 +533,16 @@ def parse_entity_details(content, entity_type, source_url):
             break
         description_elements.append(str(elem))
     
-    details['description'] = clean_html('\n'.join(description_elements), source_url)
-    details['clean_desc'] = clean_text('\n'.join(description_elements))
+    description_html = clean_html('\n'.join(description_elements), source_url)
+    description_text = clean_text(description_html)
+    description_markdown = html_to_markdown(description_html)
+    
+    details.update({
+        'description_html': description_html,
+        'description_text': description_text,
+        'description_markdown': description_markdown,
+        'clean_desc': description_text
+    })
     
     # Parse fields from tables
     for table in soup.find_all('table'):
@@ -441,11 +558,17 @@ def parse_entity_details(content, entity_type, source_url):
                 if len(cols) <= max(param_index, type_index, required_index, desc_index):
                     continue
                 
+                # Pre-format field descriptions
+                field_desc_html = clean_html(str(cols[desc_index]), source_url) if desc_index != -1 else None
+                field_desc_text = clean_text(field_desc_html) if field_desc_html else None
+                field_desc_markdown = html_to_markdown(field_desc_html) if field_desc_html else None
+                
                 field = {
                     'name': cols[param_index].text.strip(),
                     'type': clean_html(str(cols[type_index]), source_url) if type_index != -1 else None,
-                    'description': clean_html(str(cols[desc_index]), source_url) if desc_index != -1 else None,
-                    'clean_desc': clean_text(str(cols[desc_index])) if desc_index != -1 else None,
+                    'description_html': field_desc_html,
+                    'description_text': field_desc_text,
+                    'description_markdown': field_desc_markdown,
                     'required': cols[required_index].text.strip().lower() == 'yes' if required_index != -1 else False
                 }
                 details['fields'].append(field)
@@ -453,19 +576,19 @@ def parse_entity_details(content, entity_type, source_url):
     return details
 
 def clean_html(content, source_url):
-    """Clean HTML content"""
+    """Clean HTML content and fix links"""
     if not content:
         return ""
     soup = BeautifulSoup(content, 'html.parser')
-    for tag in soup.find_all(True):
-        if tag.name not in ['strong', 'b', 'a', 'i', 'em', 'code', 'pre']:
-            tag.unwrap()
+    
+    # Fix links
     for a in soup.find_all('a'):
         href = a.get('href', '').strip()
         if href.startswith('#'):
             a['href'] = f"{source_url}{href}"
         elif href.startswith('/'):
             a['href'] = f"https://core.telegram.org{href}"
+    
     return str(soup)
 
 def clean_text(content):
@@ -474,6 +597,33 @@ def clean_text(content):
         return ""
     soup = BeautifulSoup(content, 'html.parser')
     return soup.get_text().strip()
+
+def html_to_markdown(content):
+    """Convert HTML to Markdown (basic conversion)"""
+    if not content:
+        return ""
+    
+    # Basic conversions
+    content = re.sub(r'<br\s*/?>', '\n', content)
+    content = re.sub(r'<strong>(.*?)</strong>', r'**\1**', content)
+    content = re.sub(r'<b>(.*?)</b>', r'**\1**', content)
+    content = re.sub(r'<em>(.*?)</em>', r'*\1*', content)
+    content = re.sub(r'<i>(.*?)</i>', r'*\1*', content)
+    content = re.sub(r'<code>(.*?)</code>', r'`\1`', content)
+    content = re.sub(r'<pre>(.*?)</pre>', r'```\n\1\n```', content, flags=re.DOTALL)
+    
+    # Handle links
+    def replace_link(match):
+        text = match.group(1)
+        href = match.group(2)
+        return f'[{text}]({href})'
+    
+    content = re.sub(r'<a\s+href="([^"]*)"[^>]*>(.*?)</a>', replace_link, content)
+    
+    # Remove remaining HTML tags
+    content = CLEAN_PATTERN.sub('', content)
+    
+    return content.strip()
 
 def generate_search_keywords(entity):
     """Generate search keywords for entity"""
@@ -541,13 +691,15 @@ def search_in_memory(query: str, entity_type: Optional[str] = None, limit: int =
                     score += weight * 5
         
         if score > 0:
-            # Get fields for this entity
+            # Get fields and notes for this entity
             fields = full_db_cache['entity_fields'].get(entity_id, [])
+            notes = full_db_cache['entity_notes'].get(entity_id, [])
             
             results.append({
                 **entity,
                 'score': score,
                 'fields': fields,
+                'notes': notes,
                 'match_terms': query_terms
             })
     
@@ -555,24 +707,44 @@ def search_in_memory(query: str, entity_type: Optional[str] = None, limit: int =
     results.sort(key=lambda x: x['score'], reverse=True)
     return results[:limit]
 
-def fast_format_content(content: str, format_type: str = "normal") -> str:
-    """Fast content formatting"""
-    if not content:
-        return ""
-    
+def get_formatted_content(entity: Dict, format_type: str = "normal") -> Dict[str, str]:
+    """Get pre-formatted content based on format type"""
     if format_type == "html":
-        return content
-    
-    if format_type == "markdown":
-        # Basic markdown conversion
-        content = re.sub(r'<br\s*/?>', '\n', content)
-        content = re.sub(r'<strong>(.*?)</strong>', r'**\1**', content)
-        content = re.sub(r'<code>(.*?)</code>', r'`\1`', content)
-        content = CLEAN_PATTERN.sub('', content)
-        return content
-    
-    # Default: strip HTML
-    return CLEAN_PATTERN.sub('', content)
+        return {
+            "description": entity.get('description_html', ''),
+            "fields": [
+                {**field, 'description': field.get('description_html', '')} 
+                for field in entity.get('fields', [])
+            ],
+            "notes": [
+                {**note, 'content': note.get('html', '')} 
+                for note in entity.get('notes', [])
+            ]
+        }
+    elif format_type == "markdown":
+        return {
+            "description": entity.get('description_markdown', ''),
+            "fields": [
+                {**field, 'description': field.get('description_markdown', '')} 
+                for field in entity.get('fields', [])
+            ],
+            "notes": [
+                {**note, 'content': note.get('markdown', '')} 
+                for note in entity.get('notes', [])
+            ]
+        }
+    else:  # normal/text
+        return {
+            "description": entity.get('description_text', ''),
+            "fields": [
+                {**field, 'description': field.get('description_text', '')} 
+                for field in entity.get('fields', [])
+            ],
+            "notes": [
+                {**note, 'content': note.get('text', '')} 
+                for note in entity.get('notes', [])
+            ]
+        }
 
 # FastAPI App with Lifespan
 @asynccontextmanager
@@ -588,7 +760,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Ultra Fast Telegram Bot API",
-    description="Blazing fast Telegram Bot API search with proper initialization",
+    description="Blazing fast Telegram Bot API search with proper initialization and notes support",
     version="2.0.0",
     lifespan=lifespan
 )
@@ -601,7 +773,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API Routes (same as before but with proper data)
+# API Routes
 @app.get("/")
 async def root():
     return {
@@ -618,7 +790,7 @@ async def search(
     limit: int = Query(20, ge=1, le=100),
     format: str = Query("normal")
 ):
-    """Ultra-fast search endpoint"""
+    """Ultra-fast search endpoint with formatted content"""
     cache_key = generate_cache_key("search", q, type, limit, format)
     
     # Check memory cache first
@@ -632,16 +804,18 @@ async def search(
         results = search_in_memory(q, type, limit)
         search_time = (datetime.now() - start_time).total_seconds() * 1000
         
-        # Format results
+        # Format results using pre-stored formats
         formatted_results = []
         for result in results:
+            formatted_content = get_formatted_content(result, format)
+            
             formatted_results.append({
                 "id": result["id"],
                 "name": result["name"],
                 "type": result["type"],
-                "description": fast_format_content(result.get("description", ""), format),
-                "clean_desc": result.get("clean_desc", ""),
-                "fields": result.get("fields", []),
+                "description": formatted_content["description"],
+                "fields": formatted_content["fields"],
+                "notes": formatted_content["notes"],
                 "reference": f"{result['source_url']}#{result['name'].lower().replace(' ', '-')}",
                 "score": result["score"]
             })
@@ -680,6 +854,48 @@ async def list_types():
     
     memory_cache.set(cache_key, types_list)
     return JSONResponse(content=types_list)
+
+@app.get("/api/entity/{entity_name}")
+async def get_entity(entity_name: str, format: str = Query("normal")):
+    """Get specific entity by name"""
+    cache_key = generate_cache_key("entity", entity_name, format)
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
+    
+    # Find entity in cache
+    entity = None
+    for e in full_db_cache['entities'].values():
+        if e['name'] == entity_name:
+            entity_id = e['id']
+            entity = e
+            break
+    
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    
+    # Get fields and notes
+    fields = full_db_cache['entity_fields'].get(entity_id, [])
+    notes = full_db_cache['entity_notes'].get(entity_id, [])
+    
+    # Format content
+    formatted_content = get_formatted_content(
+        {**entity, 'fields': fields, 'notes': notes}, 
+        format
+    )
+    
+    response = {
+        "id": entity_id,
+        "name": entity["name"],
+        "type": entity["type"],
+        "description": formatted_content["description"],
+        "fields": formatted_content["fields"],
+        "notes": formatted_content["notes"],
+        "reference": f"{entity['source_url']}#{entity['name'].lower().replace(' ', '-')}"
+    }
+    
+    memory_cache.set(cache_key, response)
+    return JSONResponse(content=response)
 
 @app.get("/api/list")
 async def list_entities(type: str = Query(..., min_length=1)):
