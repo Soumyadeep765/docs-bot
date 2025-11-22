@@ -499,7 +499,7 @@ def parse_entity_details(content, entity_type, source_url):
             break
         description_elements.append(str(elem))
     
-    description_html = clean_html('\n'.join(description_elements), source_url)
+    description_html = clean_html(''.join(description_elements), source_url)
     description_text = clean_text(description_html)
     description_markdown = html_to_markdown(description_html)
     clean_desc = clean_text('\n'.join(description_elements))
