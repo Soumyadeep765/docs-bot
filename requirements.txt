@@ -10,3 +10,4 @@ unidecode
 python-multipart
 httptools
 h2
+python-telegram-bot
