@@ -74,6 +74,8 @@ WORD_PATTERN = re.compile(r'\b\w{3,}\b')
 NAME_PATTERN = re.compile(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)')
 NOTE_PATTERN = re.compile(r'<strong>(\d+)\.</strong>\s*(.*?)(?=<strong>\d+\.</strong>|</blockquote>|$)', re.DOTALL)
 BLOCKQUOTE_PATTERN = re.compile(r'<blockquote>(.*?)</blockquote>', re.DOTALL)
+SYMBOL_PATTERN = re.compile(r'\$([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)')
+ESCAPED_SYMBOL_PATTERN = re.compile(r'\$\$([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)')
 
 full_db_cache = {}
 
@@ -499,7 +501,7 @@ def parse_entity_details(content, entity_type, source_url):
             break
         description_elements.append(str(elem))
     
-    description_html = clean_html(''.join(description_elements), source_url)
+    description_html = clean_html('\n'.join(description_elements), source_url)
     description_text = clean_text(description_html)
     description_markdown = html_to_markdown(description_html)
     clean_desc = clean_text('\n'.join(description_elements))
@@ -696,6 +698,108 @@ def get_formatted_content(entity: Dict, format_type: str = "normal") -> Dict[str
             ]
         }
 
+def parse_special_query(query: str) -> Tuple[str, Optional[str], bool, bool]:
+    original_query = query
+    entity_type = None
+    is_property_search = False
+    is_wildcard_search = False
+    
+    if query.startswith('!'):
+        parts = query[1:].split(' ', 1)
+        if len(parts) > 0 and parts[0]:
+            entity_type = parts[0].lower()
+            query = parts[1] if len(parts) > 1 else ""
+    
+    if query.startswith('.'):
+        is_property_search = True
+        query = query[1:]
+    
+    if '*' in query or '_' in query:
+        is_wildcard_search = True
+    
+    return query.strip(), entity_type, is_property_search, is_wildcard_search
+
+def advanced_search_in_memory(query: str, entity_type: Optional[str] = None, 
+                            is_property_search: bool = False, 
+                            is_wildcard_search: bool = False,
+                            limit: int = 20) -> List[Dict]:
+    if not query:
+        return []
+    
+    results = []
+    
+    for entity_id, entity in full_db_cache['entities'].items():
+        if entity_type and entity['type'] != entity_type:
+            continue
+        
+        score = 0
+        
+        if is_wildcard_search:
+            pattern = query.replace('*', '.*').replace('_', '.')
+            if re.search(pattern, entity['name'], re.IGNORECASE):
+                score += 1000
+        else:
+            if entity['name'].lower() == query.lower():
+                score += 1000
+            elif query.lower() in entity['name'].lower():
+                score += 500
+        
+        if is_property_search:
+            fields = full_db_cache['entity_fields'].get(entity_id, [])
+            for field in fields:
+                if is_wildcard_search:
+                    pattern = query.replace('*', '.*').replace('_', '.')
+                    if re.search(pattern, field['name'], re.IGNORECASE):
+                        score += 800
+                else:
+                    if query.lower() in field['name'].lower():
+                        score += 300
+        
+        if score > 0:
+            fields = full_db_cache['entity_fields'].get(entity_id, [])
+            notes = full_db_cache['entity_notes'].get(entity_id, [])
+            
+            results.append({
+                **entity,
+                'score': score,
+                'fields': fields,
+                'notes': notes
+            })
+    
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:limit]
+
+def format_symbols(text: str) -> str:
+    def replace_symbol(match):
+        symbol = match.group(1)
+        parts = symbol.split('.')
+        
+        if len(parts) == 1:
+            return f'<code>{symbol}</code>'
+        else:
+            entity_name = parts[0]
+            field_name = parts[1] if len(parts) > 1 else None
+            
+            for entity in full_db_cache['entities'].values():
+                if entity['name'] == entity_name:
+                    if field_name:
+                        fields = full_db_cache['entity_fields'].get(entity['id'], [])
+                        for field in fields:
+                            if field['name'] == field_name:
+                                return f'<code>{field_name}</code>'
+                    return f'<code>{entity_name}</code>'
+            
+            return f'<code>{symbol}</code>'
+    
+    def replace_escaped_symbol(match):
+        symbol = match.group(1)
+        return f'<code>{symbol}</code>'
+    
+    text = ESCAPED_SYMBOL_PATTERN.sub(replace_escaped_symbol, text)
+    text = SYMBOL_PATTERN.sub(replace_symbol, text)
+    
+    return text
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -725,7 +829,20 @@ async def root():
         "status": "🚀 Ultra Fast Telegram Bot API",
         "entities": full_db_cache['entity_count'],
         "cache_stats": memory_cache.stats(),
-        "last_updated": full_db_cache['last_updated'].isoformat()
+        "last_updated": full_db_cache['last_updated'].isoformat(),
+        "features": {
+            "special_queries": {
+                "!type": "Filter by category (e.g., !method sendMessage)",
+                ".property": "Search properties/parameters (e.g., .message_id)",
+                "*": "Wildcard - matches zero or more characters",
+                "_": "Wildcard - matches exactly one character"
+            },
+            "symbol_formatting": {
+                "$symbol": "Format API symbols",
+                "$$symbol": "Format without replacing Abc.xyz with xyz",
+                ".f": "Auto-deep-link API symbols"
+            }
+        }
     }
 
 @app.get("/api/search")
@@ -733,9 +850,10 @@ async def search(
     q: str = Query(..., min_length=1, max_length=100),
     type: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    format: str = Query("normal")
+    format: str = Query("normal"),
+    advanced: bool = Query(False)
 ):
-    cache_key = generate_cache_key("search", q, type, limit, format)
+    cache_key = generate_cache_key("search", q, type, limit, format, advanced)
     
     cached_result = memory_cache.get(cache_key)
     if cached_result:
@@ -743,7 +861,13 @@ async def search(
     
     try:
         start_time = datetime.now()
-        results = search_in_memory(q, type, limit)
+        
+        if advanced:
+            query, entity_type, is_property_search, is_wildcard_search = parse_special_query(q)
+            results = advanced_search_in_memory(query, entity_type, is_property_search, is_wildcard_search, limit)
+        else:
+            results = search_in_memory(q, type, limit)
+        
         search_time = (datetime.now() - start_time).total_seconds() * 1000
         
         formatted_results = []
@@ -767,7 +891,8 @@ async def search(
             "count": len(formatted_results),
             "results": formatted_results,
             "search_time_ms": search_time,
-            "format": format
+            "format": format,
+            "advanced": advanced
         }
         
         memory_cache.set(cache_key, response)
@@ -777,6 +902,98 @@ async def search(
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
+
+@app.get("/api/format")
+async def format_text(
+    text: str = Query(..., min_length=1),
+    mode: str = Query("symbols")
+):
+    cache_key = generate_cache_key("format", text, mode)
+    
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
+    
+    try:
+        if mode == "symbols":
+            formatted_text = format_symbols(text)
+        else:
+            formatted_text = text
+        
+        response = {
+            "original": text,
+            "formatted": formatted_text,
+            "mode": mode
+        }
+        
+        memory_cache.set(cache_key, response)
+        return JSONResponse(content=response)
+        
+    except Exception as e:
+        logger.error(f"Format error: {e}")
+        raise HTTPException(status_code=500, detail="Formatting failed")
+
+@app.get("/api/symbols")
+async def get_symbols(
+    symbol: str = Query(..., min_length=1)
+):
+    cache_key = generate_cache_key("symbols", symbol)
+    
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
+    
+    try:
+        parts = symbol.split('.')
+        entity_name = parts[0]
+        field_name = parts[1] if len(parts) > 1 else None
+        
+        entity = None
+        for e in full_db_cache['entities'].values():
+            if e['name'] == entity_name:
+                entity_id = e['id']
+                entity = e
+                break
+        
+        if not entity:
+            raise HTTPException(status_code=404, detail="Symbol not found")
+        
+        fields = full_db_cache['entity_fields'].get(entity_id, [])
+        notes = full_db_cache['entity_notes'].get(entity_id, [])
+        
+        if field_name:
+            field_info = None
+            for field in fields:
+                if field['name'] == field_name:
+                    field_info = field
+                    break
+            
+            if not field_info:
+                raise HTTPException(status_code=404, detail="Field not found")
+            
+            response = {
+                "symbol": symbol,
+                "type": "field",
+                "entity": entity_name,
+                "field": field_info,
+                "reference": f"{entity['source_url']}#{entity_name.lower().replace(' ', '-')}"
+            }
+        else:
+            response = {
+                "symbol": symbol,
+                "type": "entity",
+                "entity": entity,
+                "fields": fields,
+                "notes": notes,
+                "reference": f"{entity['source_url']}#{entity_name.lower().replace(' ', '-')}"
+            }
+        
+        memory_cache.set(cache_key, response)
+        return JSONResponse(content=response)
+        
+    except Exception as e:
+        logger.error(f"Symbol lookup error: {e}")
+        raise HTTPException(status_code=500, detail="Symbol lookup failed")
 
 @app.get("/api/types")
 async def list_types():
