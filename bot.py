@@ -602,7 +602,7 @@ class TelegramBotAPISearch:
         output = ''
         length = 0
         tag_stack = []
-        parts = html.split(/(<[^>]+>)/)
+        parts = re.split(r'(<[^>]+>)', html)
         
         for part in parts:
             if not part:
