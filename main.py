@@ -28,6 +28,7 @@ BOT_API_URL = 'https://core.telegram.org/bots/api'
 WEBAPPS_URL = 'https://core.telegram.org/bots/webapps'
 FEATURES_URL = 'https://core.telegram.org/bots/features'
 FAQ_URL = 'https://core.telegram.org/bots/faq'
+TUTORIAL_URL = 'https://core.telegram.org/bots/tutorial'
 DB_FILE = 'bot_api.db'
 CACHE_DURATION = 3600
 
@@ -74,8 +75,6 @@ WORD_PATTERN = re.compile(r'\b\w{3,}\b')
 NAME_PATTERN = re.compile(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)')
 NOTE_PATTERN = re.compile(r'<strong>(\d+)\.</strong>\s*(.*?)(?=<strong>\d+\.</strong>|</blockquote>|$)', re.DOTALL)
 BLOCKQUOTE_PATTERN = re.compile(r'<blockquote>(.*?)</blockquote>', re.DOTALL)
-SYMBOL_PATTERN = re.compile(r'\$([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)')
-ESCAPED_SYMBOL_PATTERN = re.compile(r'\$\$([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)')
 
 full_db_cache = {}
 
@@ -252,7 +251,8 @@ async def update_documentation_data():
             (BOT_API_URL, await fetch_bot_api()),
             (WEBAPPS_URL, await fetch_webapps()),
             (FEATURES_URL, await fetch_features()),
-            (FAQ_URL, await fetch_faq())
+            (FAQ_URL, await fetch_faq()),
+            (TUTORIAL_URL, await fetch_tutorial())
         ]
         
         entity_count = 0
@@ -315,6 +315,17 @@ async def fetch_faq():
         logger.error(f"Failed to fetch FAQ: {e}")
         return None
 
+async def fetch_tutorial():
+    try:
+        response = await client.get(TUTORIAL_URL)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        content_div = soup.find('div', class_='dev_page_content') or soup.find(id='dev_page_content')
+        return parse_sections(content_div, ['h2', 'h3', 'h4']) if content_div else None
+    except Exception as e:
+        logger.error(f"Failed to fetch Tutorial: {e}")
+        return None
+
 def parse_sections(content_div, heading_tags):
     if not content_div:
         return []
@@ -360,6 +371,8 @@ def determine_entity_type(title, source_url):
         return 'feature'
     elif source_url == FAQ_URL:
         return 'faq'
+    elif source_url == TUTORIAL_URL:
+        return 'tutorial'
     return 'other'
 
 def extract_notes(content: str) -> Tuple[str, List[Dict]]:
@@ -769,37 +782,6 @@ def advanced_search_in_memory(query: str, entity_type: Optional[str] = None,
     results.sort(key=lambda x: x['score'], reverse=True)
     return results[:limit]
 
-def format_symbols(text: str) -> str:
-    def replace_symbol(match):
-        symbol = match.group(1)
-        parts = symbol.split('.')
-        
-        if len(parts) == 1:
-            return f'<code>{symbol}</code>'
-        else:
-            entity_name = parts[0]
-            field_name = parts[1] if len(parts) > 1 else None
-            
-            for entity in full_db_cache['entities'].values():
-                if entity['name'] == entity_name:
-                    if field_name:
-                        fields = full_db_cache['entity_fields'].get(entity['id'], [])
-                        for field in fields:
-                            if field['name'] == field_name:
-                                return f'<code>{field_name}</code>'
-                    return f'<code>{entity_name}</code>'
-            
-            return f'<code>{symbol}</code>'
-    
-    def replace_escaped_symbol(match):
-        symbol = match.group(1)
-        return f'<code>{symbol}</code>'
-    
-    text = ESCAPED_SYMBOL_PATTERN.sub(replace_escaped_symbol, text)
-    text = SYMBOL_PATTERN.sub(replace_symbol, text)
-    
-    return text
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -836,11 +818,6 @@ async def root():
                 ".property": "Search properties/parameters (e.g., .message_id)",
                 "*": "Wildcard - matches zero or more characters",
                 "_": "Wildcard - matches exactly one character"
-            },
-            "symbol_formatting": {
-                "$symbol": "Format API symbols",
-                "$$symbol": "Format without replacing Abc.xyz with xyz",
-                ".f": "Auto-deep-link API symbols"
             }
         }
     }
@@ -902,98 +879,6 @@ async def search(
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
-
-@app.get("/api/format")
-async def format_text(
-    text: str = Query(..., min_length=1),
-    mode: str = Query("symbols")
-):
-    cache_key = generate_cache_key("format", text, mode)
-    
-    cached_result = memory_cache.get(cache_key)
-    if cached_result:
-        return JSONResponse(content=cached_result)
-    
-    try:
-        if mode == "symbols":
-            formatted_text = format_symbols(text)
-        else:
-            formatted_text = text
-        
-        response = {
-            "original": text,
-            "formatted": formatted_text,
-            "mode": mode
-        }
-        
-        memory_cache.set(cache_key, response)
-        return JSONResponse(content=response)
-        
-    except Exception as e:
-        logger.error(f"Format error: {e}")
-        raise HTTPException(status_code=500, detail="Formatting failed")
-
-@app.get("/api/symbols")
-async def get_symbols(
-    symbol: str = Query(..., min_length=1)
-):
-    cache_key = generate_cache_key("symbols", symbol)
-    
-    cached_result = memory_cache.get(cache_key)
-    if cached_result:
-        return JSONResponse(content=cached_result)
-    
-    try:
-        parts = symbol.split('.')
-        entity_name = parts[0]
-        field_name = parts[1] if len(parts) > 1 else None
-        
-        entity = None
-        for e in full_db_cache['entities'].values():
-            if e['name'] == entity_name:
-                entity_id = e['id']
-                entity = e
-                break
-        
-        if not entity:
-            raise HTTPException(status_code=404, detail="Symbol not found")
-        
-        fields = full_db_cache['entity_fields'].get(entity_id, [])
-        notes = full_db_cache['entity_notes'].get(entity_id, [])
-        
-        if field_name:
-            field_info = None
-            for field in fields:
-                if field['name'] == field_name:
-                    field_info = field
-                    break
-            
-            if not field_info:
-                raise HTTPException(status_code=404, detail="Field not found")
-            
-            response = {
-                "symbol": symbol,
-                "type": "field",
-                "entity": entity_name,
-                "field": field_info,
-                "reference": f"{entity['source_url']}#{entity_name.lower().replace(' ', '-')}"
-            }
-        else:
-            response = {
-                "symbol": symbol,
-                "type": "entity",
-                "entity": entity,
-                "fields": fields,
-                "notes": notes,
-                "reference": f"{entity['source_url']}#{entity_name.lower().replace(' ', '-')}"
-            }
-        
-        memory_cache.set(cache_key, response)
-        return JSONResponse(content=response)
-        
-    except Exception as e:
-        logger.error(f"Symbol lookup error: {e}")
-        raise HTTPException(status_code=500, detail="Symbol lookup failed")
 
 @app.get("/api/types")
 async def list_types():
