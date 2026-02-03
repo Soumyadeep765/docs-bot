@@ -18,6 +18,8 @@ from contextlib import asynccontextmanager
 import uvloop
 from bs4 import BeautifulSoup
 from unidecode import unidecode
+import secrets
+import string
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -76,13 +78,21 @@ NAME_PATTERN = re.compile(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)')
 NOTE_PATTERN = re.compile(r'<strong>(\d+)\.</strong>\s*(.*?)(?=<strong>\d+\.</strong>|</blockquote>|$)', re.DOTALL)
 BLOCKQUOTE_PATTERN = re.compile(r'<blockquote>(.*?)</blockquote>', re.DOTALL)
 
+# Store all data in memory for fast access
 full_db_cache = {}
+entity_id_map = {}  # Maps unique IDs to entity data
+field_id_map = {}   # Maps field IDs to field data
 
 client = httpx.AsyncClient(
     timeout=30.0,
     limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
     http2=True
 )
+
+def generate_short_id(length=8):
+    """Generate a unique short ID"""
+    alphabet = string.ascii_lowercase + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
@@ -94,6 +104,7 @@ async def init_db():
         await db.execute('''
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             type TEXT NOT NULL,
             content TEXT,
@@ -110,7 +121,8 @@ async def init_db():
         await db.execute('''
         CREATE TABLE IF NOT EXISTS fields (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_id INTEGER NOT NULL,
+            field_id TEXT UNIQUE NOT NULL,
+            entity_id TEXT NOT NULL,
             name TEXT NOT NULL,
             type TEXT,
             description_html TEXT,
@@ -118,7 +130,7 @@ async def init_db():
             description_markdown TEXT,
             clean_desc TEXT,
             required INTEGER DEFAULT 0,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+            FOREIGN KEY (entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE,
             UNIQUE(entity_id, name)
         )
         ''')
@@ -126,29 +138,32 @@ async def init_db():
         await db.execute('''
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_id INTEGER NOT NULL,
+            entity_id TEXT NOT NULL,
             note_number INTEGER NOT NULL,
             content_html TEXT NOT NULL,
             content_text TEXT NOT NULL,
             content_markdown TEXT NOT NULL,
             clean_desc TEXT NOT NULL,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+            FOREIGN KEY (entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE,
             UNIQUE(entity_id, note_number)
         )
         ''')
         
         await db.execute('''
         CREATE TABLE IF NOT EXISTS search_index (
-            entity_id INTEGER NOT NULL,
+            entity_id TEXT NOT NULL,
             keyword TEXT NOT NULL,
             weight INTEGER DEFAULT 1,
-            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+            FOREIGN KEY (entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE,
             PRIMARY KEY (entity_id, keyword)
         )
         ''')
         
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_entities_entity_id ON entities(entity_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_fields_field_id ON fields(field_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_fields_entity_id ON fields(entity_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_search_keyword ON search_index(keyword)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_search_entity ON search_index(entity_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_notes_entity ON notes(entity_id)')
@@ -156,22 +171,26 @@ async def init_db():
         await db.execute('PRAGMA foreign_keys = ON')
         await db.commit()
         
-        logger.info("Database initialized with optimized schema including notes")
+        logger.info("Database initialized with unique IDs schema")
 
 async def load_full_db_cache():
-    global full_db_cache
+    global full_db_cache, entity_id_map, field_id_map
     
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         
         entities = {}
+        entity_id_map = {}
         async with db.execute('''
-            SELECT id, name, type, description_html, description_text, description_markdown, 
+            SELECT entity_id, name, type, description_html, description_text, description_markdown, 
                    clean_desc, source_url
             FROM entities
         ''') as cursor:
             async for row in cursor:
-                entities[row['id']] = dict(row)
+                entity_data = dict(row)
+                entity_id = row['entity_id']
+                entities[entity_id] = entity_data
+                entity_id_map[entity_id] = entity_data
         
         search_terms = {}
         async with db.execute('''
@@ -185,15 +204,20 @@ async def load_full_db_cache():
                 search_terms[entity_id].append((row['keyword'], row['weight']))
         
         entity_fields = {}
+        field_id_map = {}
         async with db.execute('''
-            SELECT entity_id, name, type, description_html, description_text, description_markdown, clean_desc, required
+            SELECT field_id, entity_id, name, type, description_html, description_text, 
+                   description_markdown, clean_desc, required
             FROM fields
         ''') as cursor:
             async for row in cursor:
                 entity_id = row['entity_id']
+                field_id = row['field_id']
+                field_data = dict(row)
                 if entity_id not in entity_fields:
                     entity_fields[entity_id] = []
-                entity_fields[entity_id].append(dict(row))
+                entity_fields[entity_id].append(field_data)
+                field_id_map[field_id] = field_data
         
         entity_notes = {}
         async with db.execute('''
@@ -419,12 +443,16 @@ async def save_entity_to_db(section, source_url):
     
     details = parse_entity_details(cleaned_content, entity_type, source_url)
     
+    # Generate unique ID for entity
+    entity_id = generate_short_id()
+    
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute(
-            '''INSERT INTO entities (name, type, content, description_html, description_text, 
+            '''INSERT INTO entities (entity_id, name, type, content, description_html, description_text, 
             description_markdown, clean_desc, last_updated, source_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (
+                entity_id,
                 section['title'],
                 entity_type,
                 section['content'],
@@ -436,7 +464,6 @@ async def save_entity_to_db(section, source_url):
                 source_url
             )
         )
-        entity_id = cursor.lastrowid
         
         for note in notes:
             await db.execute(
@@ -452,12 +479,15 @@ async def save_entity_to_db(section, source_url):
                 )
             )
         
-        for field in details.get('fields', []):
+        # Generate unique IDs for fields
+        for idx, field in enumerate(details.get('fields', [])):
+            field_id = f"{entity_id}_{idx+1}"  # Format: entityid_1, entityid_2, etc.
             await db.execute(
-                '''INSERT INTO fields (entity_id, name, type, description_html, description_text, 
+                '''INSERT INTO fields (field_id, entity_id, name, type, description_html, description_text, 
                 description_markdown, clean_desc, required)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
+                    field_id,
                     entity_id,
                     field['name'],
                     field.get('type'),
@@ -664,6 +694,7 @@ def search_in_memory(query: str, entity_type: Optional[str] = None, limit: int =
             
             results.append({
                 **entity,
+                'entity_id': entity_id,
                 'score': score,
                 'fields': fields,
                 'notes': notes,
@@ -774,6 +805,7 @@ def advanced_search_in_memory(query: str, entity_type: Optional[str] = None,
             
             results.append({
                 **entity,
+                'entity_id': entity_id,
                 'score': score,
                 'fields': fields,
                 'notes': notes
@@ -787,14 +819,14 @@ async def lifespan(app: FastAPI):
     await init_db()
     await initial_data_load()
     await load_full_db_cache()
-    logger.info("🚀 Server started with full DB caching and initialization")
+    logger.info("🚀 Server started with unique IDs and full DB caching")
     yield
     await client.aclose()
 
 app = FastAPI(
     title="Ultra Fast Telegram Bot API",
-    description="Blazing fast Telegram Bot API search with proper initialization and notes support",
-    version="2.0.0",
+    description="Blazing fast Telegram Bot API search with unique IDs",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -813,7 +845,9 @@ async def root():
         "cache_stats": memory_cache.stats(),
         "last_updated": full_db_cache['last_updated'].isoformat(),
         "features": {
-            "special_queries": {
+            "search": "Use /api/search?q=query",
+            "lookup_by_id": "Use /api/lookup/id/{entity_id} or /api/lookup/field/{field_id}",
+            "advanced_search": {
                 "!type": "Filter by category (e.g., !method sendMessage)",
                 ".property": "Search properties/parameters (e.g., .message_id)",
                 "*": "Wildcard - matches zero or more characters",
@@ -852,12 +886,13 @@ async def search(
             formatted_content = get_formatted_content(result, format)
             
             formatted_results.append({
-                "id": result["id"],
+                "id": result["entity_id"],
                 "name": result["name"],
                 "type": result["type"],
                 "description": formatted_content["description"],
                 "clean_desc": result.get('clean_desc', ''),
-                "fields": formatted_content["fields"],
+                "fields": [{"id": f['field_id'], **{k: v for k, v in f.items() if k != 'field_id'}} 
+                          for f in formatted_content["fields"]],
                 "notes": formatted_content["notes"],
                 "reference": f"{result['source_url']}#{result['name'].lower().replace(' ', '-')}",
                 "score": result["score"]
@@ -880,22 +915,83 @@ async def search(
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
-@app.get("/api/types")
-async def list_types():
-    cache_key = "types_list"
+@app.get("/api/lookup/id/{entity_id}")
+async def lookup_by_id(entity_id: str, format: str = Query("normal")):
+    cache_key = generate_cache_key("lookup_id", entity_id, format)
     cached_result = memory_cache.get(cache_key)
     if cached_result:
         return JSONResponse(content=cached_result)
     
-    types_count = {}
-    for entity in full_db_cache['entities'].values():
-        types_count[entity['type']] = types_count.get(entity['type'], 0) + 1
+    if entity_id not in entity_id_map:
+        raise HTTPException(status_code=404, detail="Entity not found")
     
-    types_list = [{"id": type_id, "name": type_id.title(), "count": count} 
-                 for type_id, count in types_count.items()]
+    entity = entity_id_map[entity_id]
+    entity_id_in_cache = entity['entity_id'] if 'entity_id' in entity else entity_id
+    fields = full_db_cache['entity_fields'].get(entity_id_in_cache, [])
+    notes = full_db_cache['entity_notes'].get(entity_id_in_cache, [])
     
-    memory_cache.set(cache_key, types_list)
-    return JSONResponse(content=types_list)
+    formatted_content = get_formatted_content(
+        {**entity, 'fields': fields, 'notes': notes}, 
+        format
+    )
+    
+    response = {
+        "id": entity_id,
+        "name": entity["name"],
+        "type": entity["type"],
+        "description": formatted_content["description"],
+        "clean_desc": entity.get('clean_desc', ''),
+        "fields": [{"id": f['field_id'], **{k: v for k, v in f.items() if k != 'field_id'}} 
+                  for f in formatted_content["fields"]],
+        "notes": formatted_content["notes"],
+        "reference": f"{entity['source_url']}#{entity['name'].lower().replace(' ', '-')}"
+    }
+    
+    memory_cache.set(cache_key, response)
+    return JSONResponse(content=response)
+
+@app.get("/api/lookup/field/{field_id}")
+async def lookup_field(field_id: str, format: str = Query("normal")):
+    cache_key = generate_cache_key("lookup_field", field_id, format)
+    cached_result = memory_cache.get(cache_key)
+    if cached_result:
+        return JSONResponse(content=cached_result)
+    
+    if field_id not in field_id_map:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    field = field_id_map[field_id]
+    entity_id = field['entity_id']
+    
+    if entity_id not in entity_id_map:
+        raise HTTPException(status_code=404, detail="Parent entity not found")
+    
+    entity = entity_id_map[entity_id]
+    
+    formatted_field = field.copy()
+    if format == "html":
+        formatted_field['description'] = field.get('description_html', '')
+    elif format == "markdown":
+        formatted_field['description'] = field.get('description_markdown', '')
+    else:
+        formatted_field['description'] = field.get('description_text', '')
+    
+    response = {
+        "id": field_id,
+        "name": field["name"],
+        "type": field.get("type"),
+        "description": formatted_field['description'],
+        "clean_desc": field.get('clean_desc', ''),
+        "required": field.get('required', False),
+        "parent_entity": {
+            "id": entity_id,
+            "name": entity["name"],
+            "type": entity["type"]
+        }
+    }
+    
+    memory_cache.set(cache_key, response)
+    return JSONResponse(content=response)
 
 @app.get("/api/entity/{entity_name}")
 async def get_entity(entity_name: str, format: str = Query("normal")):
@@ -905,10 +1001,11 @@ async def get_entity(entity_name: str, format: str = Query("normal")):
         return JSONResponse(content=cached_result)
     
     entity = None
-    for e in full_db_cache['entities'].values():
+    entity_id = None
+    for e_id, e in full_db_cache['entities'].items():
         if e['name'] == entity_name:
-            entity_id = e['id']
             entity = e
+            entity_id = e_id
             break
     
     if not entity:
@@ -928,29 +1025,14 @@ async def get_entity(entity_name: str, format: str = Query("normal")):
         "type": entity["type"],
         "description": formatted_content["description"],
         "clean_desc": entity.get('clean_desc', ''),
-        "fields": formatted_content["fields"],
+        "fields": [{"id": f['field_id'], **{k: v for k, v in f.items() if k != 'field_id'}} 
+                  for f in formatted_content["fields"]],
         "notes": formatted_content["notes"],
         "reference": f"{entity['source_url']}#{entity['name'].lower().replace(' ', '-')}"
     }
     
     memory_cache.set(cache_key, response)
     return JSONResponse(content=response)
-
-@app.get("/api/list")
-async def list_entities(type: str = Query(..., min_length=1)):
-    cache_key = generate_cache_key("list", type)
-    cached_result = memory_cache.get(cache_key)
-    if cached_result:
-        return JSONResponse(content=cached_result)
-    
-    entities = []
-    for entity in full_db_cache['entities'].values():
-        if entity['type'] == type:
-            entities.append(entity['name'])
-    
-    entities.sort()
-    memory_cache.set(cache_key, entities)
-    return JSONResponse(content=entities)
 
 @app.post("/api/update")
 async def update_docs():
