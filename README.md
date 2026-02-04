@@ -91,13 +91,6 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### Docker
-
-```bash
-docker build -t docs-bot .
-docker run -p 5000:5000 docs-bot
-```
-
 ---
 
 ## API Usage Examples
